@@ -1,0 +1,12 @@
+.{
+    .name = .fx_agent_memory,
+    .version = "0.0.0",
+    .fingerprint = 0x8f8478bd76bfd591,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
