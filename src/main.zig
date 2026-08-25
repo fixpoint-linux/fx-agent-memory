@@ -49,6 +49,11 @@ extern fn opendir(path: [*:0]const u8) ?*l.DIR;
 extern fn readdir(dir: ?*l.DIR) ?*l.struct_dirent;
 extern fn closedir(dir: ?*l.DIR) c_int;
 extern fn unlink(path: [*:0]const u8) c_int;
+extern fn dl_txn_begin(db: ?*anyopaque) c_int;
+extern fn dl_txn_add_fact(db: ?*anyopaque, rel_name: [*:0]const u8, cols: [*c]const u32, arity: u8) c_int;
+extern fn dl_txn_cas(db: ?*anyopaque, entity: [*:0]const u8, expected: u32, new_value: u32) c_int;
+extern fn dl_txn_commit(db: ?*anyopaque) c_int;
+extern fn dl_txn_rollback(db: ?*anyopaque) c_int;
 
 // ---------------------------------------------------------------------------
 // Small typed wrapper over the opaque C handle.
@@ -63,6 +68,25 @@ const Ctx = struct {
 
 fn intern(ctx: *Ctx, s: []const u8) u32 {
     return dl.dl_intern_str(ctx.db, s.ptr);
+}
+
+// Intern a slice that is NOT NUL-terminated (e.g. a slice into a file buffer):
+// dl_intern_str reads a C string, so a non-terminated slice would pull in
+// trailing garbage. Copy to a sentinel buffer, intern, free.
+fn internz(ctx: *Ctx, s: []const u8) u32 {
+    const z = ctx.alloc.allocSentinel(u8, s.len, 0) catch die("oom", .{});
+    defer ctx.alloc.free(z);
+    @memcpy(z[0..s.len], s);
+    z[s.len] = 0;
+    return dl.dl_intern_str(ctx.db, z.ptr);
+}
+
+// NUL-terminated copy of a slice (for C entrypoints that take `const char*`).
+fn zdup(ctx: *Ctx, s: []const u8) [:0]u8 {
+    const z = ctx.alloc.allocSentinel(u8, s.len, 0) catch die("oom", .{});
+    @memcpy(z[0..s.len], s);
+    z[s.len] = 0;
+    return z;
 }
 
 fn declare(ctx: *Ctx, name: []const u8, arity: u8) void {
@@ -706,6 +730,262 @@ fn cmd_query(ctx: *Ctx, source: []const u8, goal_rel: []const u8) void {
 }
 
 // ---------------------------------------------------------------------------
+// bulk import (NDJSON) — hand-rolled JSON object parser
+// ---------------------------------------------------------------------------
+// Each record is one JSON object. We parse it into a small field map:
+// string values are stored unescaped (owned), numbers as raw slices (owned by
+// the input buffer) flagged via `nums`. Enough JSON for NDJSON: objects,
+// escaped strings, numbers, and the literals true/false/null (ignored).
+const JsonObj = struct {
+    names: std.ArrayListUnmanaged([]const u8) = .empty,
+    vals: std.ArrayListUnmanaged([]const u8) = .empty,
+    nums: std.ArrayListUnmanaged(bool) = .empty,
+    alloc: Alloc,
+
+    fn deinit(self: *JsonObj) void {
+        for (self.nums.items, 0..) |is_num, i| {
+            // string values are owned copies; number values point into input
+            if (!is_num) self.alloc.free(self.vals.items[i]);
+            self.alloc.free(self.names.items[i]);
+        }
+        self.names.deinit(self.alloc);
+        self.vals.deinit(self.alloc);
+        self.nums.deinit(self.alloc);
+    }
+
+    // string value for a field, or `def` when absent.
+    fn str(self: *const JsonObj, name: []const u8, def: []const u8) []const u8 {
+        for (self.names.items, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name) and !self.nums.items[i]) return self.vals.items[i];
+        }
+        return def;
+    }
+
+    // numeric value for a field, or `def` when absent / not a number.
+    fn num(self: *const JsonObj, name: []const u8, def: u32) u32 {
+        for (self.names.items, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name) and self.nums.items[i]) {
+                return std.fmt.parseInt(u32, self.vals.items[i], 10) catch def;
+            }
+        }
+        return def;
+    }
+};
+
+fn skip_ws(s: []const u8, i: *usize) void {
+    while (i.* < s.len and std.ascii.isWhitespace(s[i.*])) i.* += 1;
+}
+
+// Parse a JSON string starting at s[i] (must be '"'). Returns an owned,
+// unescaped copy, advancing i past the closing quote. Null on malformed input.
+fn json_parse_string(alloc: Alloc, s: []const u8, i: *usize) ?[]u8 {
+    if (i.* >= s.len or s[i.*] != '"') return null;
+    i.* += 1;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    while (i.* < s.len) {
+        const c = s[i.*];
+        if (c == '"') {
+            i.* += 1;
+            return out.toOwnedSlice(alloc) catch null;
+        }
+        if (c != '\\') {
+            out.append(alloc, c) catch return null;
+            i.* += 1;
+            continue;
+        }
+        i.* += 1;
+        if (i.* >= s.len) return null;
+        const e = s[i.*];
+        i.* += 1;
+        switch (e) {
+            '"' => out.append(alloc, '"') catch return null,
+            '\\' => out.append(alloc, '\\') catch return null,
+            '/' => out.append(alloc, '/') catch return null,
+            'b' => out.append(alloc, 0x08) catch return null,
+            'f' => out.append(alloc, 0x0c) catch return null,
+            'n' => out.append(alloc, '\n') catch return null,
+            'r' => out.append(alloc, '\r') catch return null,
+            't' => out.append(alloc, '\t') catch return null,
+            'u' => {
+                if (i.* + 4 > s.len) return null;
+                const cp = std.fmt.parseInt(u32, s[i.* .. i.* + 4], 16) catch return null;
+                i.* += 4;
+                // encode a BMP code point as UTF-8 (no surrogate-pair handling)
+                if (cp < 0x80) {
+                    out.append(alloc, @intCast(cp)) catch return null;
+                } else if (cp < 0x800) {
+                    out.append(alloc, @intCast(0xC0 | (cp >> 6))) catch return null;
+                    out.append(alloc, @intCast(0x80 | (cp & 0x3F))) catch return null;
+                } else {
+                    out.append(alloc, @intCast(0xE0 | (cp >> 12))) catch return null;
+                    out.append(alloc, @intCast(0x80 | ((cp >> 6) & 0x3F))) catch return null;
+                    out.append(alloc, @intCast(0x80 | (cp & 0x3F))) catch return null;
+                }
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+// Parse one JSON object from `s` into `obj`. Advances nothing (object must be
+// the whole record). Returns false on malformed JSON.
+fn json_parse_object(alloc: Alloc, s: []const u8, obj: *JsonObj) bool {
+    var i: usize = 0;
+    skip_ws(s, &i);
+    if (i >= s.len or s[i] != '{') return false;
+    i += 1;
+    while (true) {
+        skip_ws(s, &i);
+        if (i >= s.len) return false;
+        if (s[i] == '}') return true; // empty object
+        const key = json_parse_string(alloc, s, &i) orelse return false;
+        skip_ws(s, &i);
+        if (i >= s.len or s[i] != ':') {
+            alloc.free(key);
+            return false;
+        }
+        i += 1;
+        skip_ws(s, &i);
+        if (i >= s.len) return false;
+        const c = s[i];
+        var value: []const u8 = "";
+        var is_num = false;
+        if (c == '"') {
+            value = json_parse_string(alloc, s, &i) orelse {
+                alloc.free(key);
+                return false;
+            };
+        } else if (c == '-' or (c >= '0' and c <= '9')) {
+            const start = i;
+            while (i < s.len and ((s[i] >= '0' and s[i] <= '9') or s[i] == '-' or s[i] == '+' or s[i] == '.' or s[i] == 'e' or s[i] == 'E')) i += 1;
+            value = s[start..i];
+            is_num = true;
+        } else if (std.mem.startsWith(u8, s[i..], "true") or std.mem.startsWith(u8, s[i..], "false") or std.mem.startsWith(u8, s[i..], "null")) {
+            // literal: consume it, store an empty string value
+            i += if (s[i] == 't') 4 else if (s[i] == 'f') 5 else 4;
+            value = "";
+        } else {
+            alloc.free(key);
+            return false;
+        }
+        obj.names.append(alloc, key) catch return false;
+        obj.vals.append(alloc, value) catch return false;
+        obj.nums.append(alloc, is_num) catch return false;
+        skip_ws(s, &i);
+        if (i >= s.len) return false;
+        if (s[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (s[i] == '}') return true;
+        return false;
+    }
+}
+
+fn import_fail(ctx: *Ctx, comptime fmt: []const u8, args: anytype) noreturn {
+    _ = dl.dl_txn_rollback(ctx.db);
+    die("error: import failed: " ++ fmt, args);
+}
+
+fn cmd_import(ctx: *Ctx, file: []const u8) void {
+    // read the whole file via libc (mirror cmd_query)
+    const zpath = ctx.alloc.allocSentinel(u8, file.len, 0) catch die("oom", .{});
+    defer ctx.alloc.free(zpath);
+    @memcpy(zpath[0..file.len], file);
+    zpath[file.len] = 0;
+
+    const f = l.fopen(@ptrCast(zpath.ptr), "r") orelse
+        die("error: import failed: cannot open '{s}'", .{file});
+    if (l.fseek(f, 0, 2) != 0) {
+        _ = l.fclose(f);
+        die("error: import failed: cannot seek '{s}'", .{file});
+    }
+    const sz = l.ftell(f);
+    if (sz < 0) {
+        _ = l.fclose(f);
+        die("error: import failed: cannot tell '{s}'", .{file});
+    }
+    _ = l.rewind(f);
+    const buf = ctx.alloc.alloc(u8, @intCast(sz)) catch die("oom", .{});
+    defer ctx.alloc.free(buf);
+    const nr = l.fread(buf.ptr, 1, @intCast(sz), f);
+    _ = l.fclose(f);
+    const data = buf[0..nr];
+
+    if (dl.dl_txn_begin(ctx.db) != 0)
+        die("error: import failed: cannot begin transaction", .{});
+
+    var n_entity: u64 = 0;
+    var n_obs: u64 = 0;
+    var n_rel: u64 = 0;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw| {
+        // tolerate blank lines (trailing newline, stray whitespace)
+        var s = raw;
+        while (s.len > 0 and (s[0] == ' ' or s[0] == '\t' or s[0] == '\r')) s = s[1..];
+        while (s.len > 0 and (s[s.len - 1] == ' ' or s[s.len - 1] == '\t' or s[s.len - 1] == '\r')) s = s[0 .. s.len - 1];
+        if (s.len == 0) continue;
+
+        var obj = JsonObj{ .alloc = ctx.alloc };
+        defer obj.deinit();
+        if (!json_parse_object(ctx.alloc, s, &obj))
+            import_fail(ctx, "malformed JSON on line: {s}", .{s});
+
+        const kind = obj.str("k", "");
+        if (std.mem.eql(u8, kind, "entity")) {
+            const name = obj.str("name", "");
+            const etype = obj.str("type", "");
+            const created = obj.str("created", "");
+            const updated = obj.str("updated", "");
+            const rev = obj.num("rev", 0);
+            var ecols: [2]u32 = .{ internz(ctx, name), internz(ctx, etype) };
+            if (dl.dl_txn_add_fact(ctx.db, "entity", &ecols, 2) != 0)
+                import_fail(ctx, "cannot add entity fact", .{});
+            var ts_cols: [3]u32 = .{ internz(ctx, name), internz(ctx, created), internz(ctx, updated) };
+            if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ts_cols, 3) != 0)
+                import_fail(ctx, "cannot add entity_ts fact", .{});
+            if (rev > 0) {
+                // 0 -> R: fresh db starts the implicit rev row at 0.
+                const zname = zdup(ctx, name);
+                defer ctx.alloc.free(zname);
+                if (dl.dl_txn_cas(ctx.db, zname.ptr, 0, rev) != 0)
+                    import_fail(ctx, "cannot set revision for '{s}'", .{name});
+            }
+            n_entity += 1;
+        } else if (std.mem.eql(u8, kind, "obs")) {
+            const ent = obj.str("entity", "");
+            const content = obj.str("content", "");
+            const created = obj.str("created", "");
+            var ocols: [2]u32 = .{ internz(ctx, ent), internz(ctx, content) };
+            if (dl.dl_txn_add_fact(ctx.db, "observation", &ocols, 2) != 0)
+                import_fail(ctx, "cannot add observation fact", .{});
+            var tcols: [3]u32 = .{ internz(ctx, ent), internz(ctx, content), internz(ctx, created) };
+            if (dl.dl_txn_add_fact(ctx.db, "obs_ts", &tcols, 3) != 0)
+                import_fail(ctx, "cannot add obs_ts fact", .{});
+            n_obs += 1;
+        } else if (std.mem.eql(u8, kind, "rel")) {
+            const a = obj.str("from", "");
+            const b = obj.str("to", "");
+            const rtype = obj.str("type", "");
+            var rcols: [3]u32 = .{ internz(ctx, a), internz(ctx, b), internz(ctx, rtype) };
+            if (dl.dl_txn_add_fact(ctx.db, "edge", &rcols, 3) != 0)
+                import_fail(ctx, "cannot add edge fact", .{});
+            n_rel += 1;
+        } else {
+            import_fail(ctx, "unknown record kind '{s}'", .{kind});
+        }
+    }
+
+    if (dl.dl_txn_commit(ctx.db) != 0)
+        import_fail(ctx, "commit failed", .{});
+    emit("imported: {d} entities, {d} observations, {d} relations ({d} total)\n", .{
+        n_entity, n_obs, n_rel, n_entity + n_obs + n_rel,
+    });
+}
+
+// ---------------------------------------------------------------------------
 // arg parsing
 // ---------------------------------------------------------------------------
 fn parseI64(s: []const u8) ?i64 {
@@ -735,6 +1015,7 @@ const usage =
     \\  rev <name>
     \\  count [<rel>]
     \\  query <source-or-file> <goal_rel>   # run arbitrary Datalog rules, print goal tuples
+    \\  import <file.jsonl>   # bulk-load NDJSON entities/observations/relations
     \\
     \\db: $FX_AGENT_MEMORY_DB | $JING_MEMORY_DB | /home/arch/.jing/memory.dl
     \\
@@ -916,6 +1197,11 @@ pub fn main(init: std.process.Init) void {
         defer pos.deinit(alloc);
         if (pos.items.len < 2) die("error: query needs <source-or-file> <goal_rel>", .{});
         cmd_query(&ctx, pos.items[0], pos.items[1]);
+    } else if (std.mem.eql(u8, cmd, "import")) {
+        var pos = positional(cmd_args);
+        defer pos.deinit(alloc);
+        if (pos.items.len < 1) die("error: import needs <file.jsonl>", .{});
+        cmd_import(&ctx, pos.items[0]);
     } else {
         errOut("error: unknown command '{s}'\n", .{cmd});
         std.process.exit(1);
