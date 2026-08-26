@@ -338,38 +338,151 @@ fn die(comptime fmt: []const u8, args: anytype) noreturn {
 fn cmd_create(ctx: *Ctx, name: []const u8, etype: []const u8) void {
     if (entity_type(ctx, name) != null) die("error: entity '{s}' already exists", .{name});
 
+    if (dl.dl_txn_begin(ctx.db) != 0)
+        die("error: cannot begin transaction", .{});
+    const n = intern(ctx, name);
+    const ty = intern(ctx, etype);
     const now = now_iso();
-    add_fact(ctx, "entity", &.{ intern(ctx, name), intern(ctx, etype) });
-    add_fact(ctx, "entity_ts", &.{ intern(ctx, name), intern(ctx, now[0..]), intern(ctx, now[0..]) });
+    const nowsym = intern(ctx, now[0..]);
+    var ecols: [2]u32 = .{ n, ty };
+    if (dl.dl_txn_add_fact(ctx.db, "entity", &ecols, 2) != 0) {
+        _ = dl.dl_txn_rollback(ctx.db);
+        die("error: cannot add entity fact", .{});
+    }
+    var ts_cols: [3]u32 = .{ n, nowsym, nowsym };
+    if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ts_cols, 3) != 0) {
+        _ = dl.dl_txn_rollback(ctx.db);
+        die("error: cannot add entity_ts fact", .{});
+    }
     // starts the entity at revision 1 (implicit rev row starts at 0)
-    if (dl.dl_cas_revision(ctx.db, name.ptr, 0, 1) != 0)
+    if (dl.dl_txn_cas(ctx.db, name.ptr, 0, 1) != 0) {
+        _ = dl.dl_txn_rollback(ctx.db);
         die("error: CAS revision failed for '{s}'", .{name});
+    }
+    if (dl.dl_txn_commit(ctx.db) != 0) {
+        _ = dl.dl_txn_rollback(ctx.db);
+        die("error: CAS revision failed for '{s}'", .{name});
+    }
     emit("created '{s}' ({s})\n", .{ name, etype });
 }
 
 fn cmd_add_obs(ctx: *Ctx, name: []const u8, contents: []const []const u8) void {
-    const now = now_iso();
-    for (contents) |c| {
-        add_fact(ctx, "observation", &.{ intern(ctx, name), intern(ctx, c) });
-        add_fact(ctx, "obs_ts", &.{ intern(ctx, name), intern(ctx, c), intern(ctx, now[0..]) });
-        rev_bump(ctx, name);
-    }
-    // bump updated_at to now
-    var cur = prefix(ctx, "entity_ts", &.{intern(ctx, name)}, 1);
-    defer cur.deinit(ctx.alloc);
-    if (cur.items.len >= 2) {
-        del_fact(ctx, "entity_ts", cur.items[0..3]);
-        add_fact(ctx, "entity_ts", &.{ cur.items[0], cur.items[1], intern(ctx, now[0..]) });
+    var attempts: usize = 0;
+    while (true) {
+        if (dl.dl_txn_begin(ctx.db) != 0)
+            die("error: cannot begin transaction", .{});
+
+        const now = now_iso();
+        const nowsym = intern(ctx, now[0..]);
+        const namesym = intern(ctx, name);
+        for (contents) |c| {
+            const csym = intern(ctx, c);
+            var ocols: [2]u32 = .{ namesym, csym };
+            if (dl.dl_txn_add_fact(ctx.db, "observation", &ocols, 2) != 0) {
+                _ = dl.dl_txn_rollback(ctx.db);
+                die("error: cannot add observation fact", .{});
+            }
+            var tcols: [3]u32 = .{ namesym, csym, nowsym };
+            if (dl.dl_txn_add_fact(ctx.db, "obs_ts", &tcols, 3) != 0) {
+                _ = dl.dl_txn_rollback(ctx.db);
+                die("error: cannot add obs_ts fact", .{});
+            }
+        }
+        // one CAS bumping the revision by the number of observations (the engine
+        // rejects two CAS ops on the same entity in one txn, so we can't bump
+        // per-obs; a single cur -> cur+n matches the old per-obs rev_bump net).
+        {
+            const cur = rev_get(ctx, name);
+            if (dl.dl_txn_cas(ctx.db, name.ptr, cur, cur + @as(u32, @intCast(contents.len))) != 0) {
+                _ = dl.dl_txn_rollback(ctx.db);
+                die("error: CAS revision failed for '{s}'", .{name});
+            }
+        }
+        // bump updated_at to now
+        {
+            var cur = prefix(ctx, "entity_ts", &.{namesym}, 1);
+            defer cur.deinit(ctx.alloc);
+            if (cur.items.len >= 2) {
+                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
+                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
+                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
+                    _ = dl.dl_txn_rollback(ctx.db);
+                    die("error: cannot update entity_ts", .{});
+                }
+            }
+        }
+        const rc = dl.dl_txn_commit(ctx.db);
+        if (rc == 0) return;
+        _ = dl.dl_txn_rollback(ctx.db);
+        if (rc < 0) die("error: commit failed", .{});
+        // DL_E_CONFLICT: CAS validated at commit aborts the whole txn; retry
+        // the entire body (re-read rev, re-buffer) at whole-txn granularity.
+        attempts += 1;
+        if (attempts >= 50) die("error: revision conflict for '{s}'", .{name});
     }
 }
 
 fn cmd_relate(ctx: *Ctx, a: []const u8, b: []const u8, rel: []const u8) void {
-    const now = now_iso();
-    add_fact(ctx, "edge", &.{ intern(ctx, a), intern(ctx, b), intern(ctx, rel) });
-    bump_updated_at(ctx, a, now[0..]);
-    bump_updated_at(ctx, b, now[0..]);
-    rev_bump(ctx, a);
-    rev_bump(ctx, b);
+    var attempts: usize = 0;
+    while (true) {
+        if (dl.dl_txn_begin(ctx.db) != 0)
+            die("error: cannot begin transaction", .{});
+
+        const now = now_iso();
+        const nowsym = intern(ctx, now[0..]);
+        const asym = intern(ctx, a);
+        const bsym = intern(ctx, b);
+        const rsym = intern(ctx, rel);
+        var ecols: [3]u32 = .{ asym, bsym, rsym };
+        if (dl.dl_txn_add_fact(ctx.db, "edge", &ecols, 3) != 0) {
+            _ = dl.dl_txn_rollback(ctx.db);
+            die("error: cannot add edge fact", .{});
+        }
+        {
+            var cur = prefix(ctx, "entity_ts", &.{asym}, 1);
+            defer cur.deinit(ctx.alloc);
+            if (cur.items.len >= 2) {
+                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
+                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
+                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
+                    _ = dl.dl_txn_rollback(ctx.db);
+                    die("error: cannot update entity_ts", .{});
+                }
+            }
+        }
+        {
+            var cur = prefix(ctx, "entity_ts", &.{bsym}, 1);
+            defer cur.deinit(ctx.alloc);
+            if (cur.items.len >= 2) {
+                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
+                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
+                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
+                    _ = dl.dl_txn_rollback(ctx.db);
+                    die("error: cannot update entity_ts", .{});
+                }
+            }
+        }
+        const ra = rev_get(ctx, a);
+        if (dl.dl_txn_cas(ctx.db, a.ptr, ra, ra + 1) != 0) {
+            _ = dl.dl_txn_rollback(ctx.db);
+            die("error: CAS revision failed for '{s}'", .{a});
+        }
+        // self-loop (a == b): a single CAS already bumped the shared rev.
+        if (!std.mem.eql(u8, a, b)) {
+            const rb = rev_get(ctx, b);
+            if (dl.dl_txn_cas(ctx.db, b.ptr, rb, rb + 1) != 0) {
+                _ = dl.dl_txn_rollback(ctx.db);
+                die("error: CAS revision failed for '{s}'", .{b});
+            }
+        }
+        const rc = dl.dl_txn_commit(ctx.db);
+        if (rc == 0) return;
+        _ = dl.dl_txn_rollback(ctx.db);
+        if (rc < 0) die("error: commit failed", .{});
+        // DL_E_CONFLICT: retry the whole transaction at whole-txn granularity.
+        attempts += 1;
+        if (attempts >= 50) die("error: revision conflict for '{s}'", .{a});
+    }
 }
 
 fn bump_updated_at(ctx: *Ctx, name: []const u8, ts: []const u8) void {
@@ -658,12 +771,66 @@ fn cmd_del_obs(ctx: *Ctx, name: []const u8, contents: []const []const u8) void {
 }
 
 fn cmd_del_rel(ctx: *Ctx, a: []const u8, b: []const u8, rel: []const u8) void {
-    const now = now_iso();
-    del_fact(ctx, "edge", &.{ intern(ctx, a), intern(ctx, b), intern(ctx, rel) });
-    bump_updated_at(ctx, a, now[0..]);
-    bump_updated_at(ctx, b, now[0..]);
-    rev_bump(ctx, a);
-    rev_bump(ctx, b);
+    var attempts: usize = 0;
+    while (true) {
+        if (dl.dl_txn_begin(ctx.db) != 0)
+            die("error: cannot begin transaction", .{});
+
+        const now = now_iso();
+        const nowsym = intern(ctx, now[0..]);
+        const asym = intern(ctx, a);
+        const bsym = intern(ctx, b);
+        const rsym = intern(ctx, rel);
+        var ecols: [3]u32 = .{ asym, bsym, rsym };
+        if (dl.dl_txn_delete_fact(ctx.db, "edge", &ecols, 3) != 0) {
+            _ = dl.dl_txn_rollback(ctx.db);
+            die("error: cannot delete edge fact", .{});
+        }
+        {
+            var cur = prefix(ctx, "entity_ts", &.{asym}, 1);
+            defer cur.deinit(ctx.alloc);
+            if (cur.items.len >= 2) {
+                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
+                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
+                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
+                    _ = dl.dl_txn_rollback(ctx.db);
+                    die("error: cannot update entity_ts", .{});
+                }
+            }
+        }
+        {
+            var cur = prefix(ctx, "entity_ts", &.{bsym}, 1);
+            defer cur.deinit(ctx.alloc);
+            if (cur.items.len >= 2) {
+                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
+                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
+                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
+                    _ = dl.dl_txn_rollback(ctx.db);
+                    die("error: cannot update entity_ts", .{});
+                }
+            }
+        }
+        const ra = rev_get(ctx, a);
+        if (dl.dl_txn_cas(ctx.db, a.ptr, ra, ra + 1) != 0) {
+            _ = dl.dl_txn_rollback(ctx.db);
+            die("error: CAS revision failed for '{s}'", .{a});
+        }
+        // self-loop (a == b): a single CAS already bumped the shared rev.
+        if (!std.mem.eql(u8, a, b)) {
+            const rb = rev_get(ctx, b);
+            if (dl.dl_txn_cas(ctx.db, b.ptr, rb, rb + 1) != 0) {
+                _ = dl.dl_txn_rollback(ctx.db);
+                die("error: CAS revision failed for '{s}'", .{b});
+            }
+        }
+        const rc = dl.dl_txn_commit(ctx.db);
+        if (rc == 0) return;
+        _ = dl.dl_txn_rollback(ctx.db);
+        if (rc < 0) die("error: commit failed", .{});
+        // DL_E_CONFLICT: retry the whole transaction at whole-txn granularity.
+        attempts += 1;
+        if (attempts >= 50) die("error: revision conflict for '{s}'", .{a});
+    }
 }
 
 fn cmd_rev(ctx: *Ctx, name: []const u8) void {
