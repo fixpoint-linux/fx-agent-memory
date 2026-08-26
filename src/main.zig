@@ -32,6 +32,7 @@ const l = @cImport({
     @cInclude("dl.h");
     @cInclude("stdio.h");
     @cInclude("dirent.h");
+    @cInclude("dlfcn.h");
 });
 const dl = l;
 
@@ -634,6 +635,123 @@ fn cmd_search(ctx: *Ctx, terms: []const u8, top: i32) void {
     }
 }
 
+// Allocate a null-terminated copy of `s` (Zig 0.16's allocSentinel does NOT
+// copy on the c_allocator — it returns the poisoned buffer — so copy manually).
+fn sentinel(alloc: Alloc, s: []const u8) [:0]u8 {
+    const z = alloc.allocSentinel(u8, s.len, 0) catch die("oom", .{});
+    if (s.len > 0) @memcpy(z[0..s.len], s[0..s.len]);
+    return z;
+}
+
+// ---------------------------------------------------------------------------
+// vsearch: semantic search over observation CONTENT via the vector tier.
+// ---------------------------------------------------------------------------
+
+// Candidate collector callback for dl_vector_search_corpus.
+const CandCollect = struct { syms: std.ArrayListUnmanaged(u32) };
+
+fn vec_cand_cb(sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int {
+    _ = score;
+    const c: *CandCollect = @ptrCast(@alignCast(user orelse return 1));
+    c.syms.append(std.heap.c_allocator, sym) catch return 1;
+    return 0;
+}
+
+// Result printer callback for dl_vector_rerank_corpus.
+const CtxPrint = struct { ctx: *Ctx };
+
+fn vec_res_cb(sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int {
+    _ = score;
+    const p: *CtxPrint = @ptrCast(@alignCast(user orelse return 1));
+    const content = std.mem.span(dl.dl_intern_str_of(p.ctx.db, sym) orelse return 1);
+    emit("{s}\n", .{content});
+    return 0;
+}
+
+// Resolve libembed.so: env override, else next to this executable (via
+// /proc/self/exe), else the bare name (rpath/LD_LIBRARY_PATH).  The encoder is
+// dlopen'd at runtime — never linked at build time.
+fn libembed_path(buf: []u8) []const u8 {
+    if (getenv("FX_AGENT_MEMORY_LIBEMBED")) |v| {
+        const s = std.mem.span(v);
+        @memcpy(buf[0..s.len], s);
+        return buf[0..s.len];
+    }
+    var self: [4096]u8 = undefined;
+    const n = std.os.linux.readlink("/proc/self/exe", &self, self.len);
+    if (n == 0 or n >= self.len) return "libembed.so";
+    var end = n;
+    while (end > 0 and self[end - 1] != '/') end -= 1;
+    const dir = self[0..end];
+    if (dir.len + "libembed.so".len >= buf.len) return "libembed.so";
+    @memcpy(buf[0..dir.len], dir[0..dir.len]);
+    @memcpy(buf[dir.len..][0.."libembed.so".len], "libembed.so");
+    return buf[0 .. dir.len + "libembed.so".len];
+}
+
+// dlopen libembed.so lazily on first use; return the encoder symbol.
+// dl_embed_encode_query is exported from libembed.so (a C++ shared lib, loaded
+// at runtime via dlopen — never linked at build time).
+const EncodeQueryFn = *const fn ([*:0]const u8, [*:0]const u8, [*:0]const u8, [*c]u32, [*c]u32, [*c]u8, usize) callconv(.c) c_int;
+
+fn embed_encode_fn() EncodeQueryFn {
+    var pb: [4096]u8 = undefined;
+    const path = libembed_path(&pb);
+    const pbuf = std.heap.c_allocator.alloc(u8, path.len + 1) catch die("oom", .{});
+    defer std.heap.c_allocator.free(pbuf);
+    @memcpy(pbuf[0..path.len], path[0..path.len]);
+    pbuf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(pbuf.ptr);
+    const handle = l.dlopen(path_z, l.RTLD_NOW) orelse {
+        const msg = if (l.dlerror()) |e| std.mem.span(@as([*:0]const u8, @ptrCast(e))) else "?";
+        die("error: libembed.so dlopen failed (tried '{s}'): {s}", .{ path, msg });
+    };
+    const sym = l.dlsym(handle, "dl_embed_encode_query") orelse {
+        die("error: libembed.so missing dl_embed_encode_query symbol", .{});
+    };
+    return @ptrCast(@alignCast(sym));
+}
+
+fn cmd_vsearch(ctx: *Ctx, query: []const u8, k: c_int, radius: c_int, dbdir: []const u8) void {
+    // guard: content vector index must exist.
+    const n_vec = dl.dl_count(ctx.db, "__vec_obs__");
+    if (n_vec == 0 or n_vec == std.math.maxInt(u64))
+        die("error: no observation vector index — run the content pipeline first", .{});
+
+    // encode the query in-process via the dlopen'd encoder.
+    const encode = embed_encode_fn();
+    var sig: [8]u32 = undefined;
+    var ivec: [96]u32 = undefined;
+    const dbdir_z = sentinel(ctx.alloc, dbdir);
+    defer ctx.alloc.free(dbdir_z);
+    const query_z = sentinel(ctx.alloc, query);
+    defer ctx.alloc.free(query_z);
+    var errbuf: [512:0]u8 = undefined;
+    const rc = encode(dbdir_z.ptr, "_obs", query_z.ptr, &sig, &ivec, &errbuf, errbuf.len);
+    if (rc != 0) die("error: {s}", .{std.mem.sliceTo(@as([*:0]const u8, &errbuf), 0)});
+
+    // content corpus descriptor (built in Zig — the C macros don't translate).
+    const corpus = dl.struct_dl_vec_corpus{
+        .filter_rel = "observation",
+        .filter_col = 1,
+        .sig_rel_fmt = "__obssig%d__",
+        .vec_rel = "__vec_obs__",
+        .basis_suffix = "_obs",
+    };
+
+    // (1) candidate retrieval.
+    var collect = CandCollect{ .syms = .empty };
+    defer collect.syms.deinit(ctx.alloc);
+    const n_cand = dl.dl_vector_search_corpus(ctx.db, &corpus, &sig, k * 10, radius, vec_cand_cb, &collect);
+    if (n_cand < 0) die("error: vector search failed", .{});
+    if (n_cand == 0) return;
+
+    // (2) int8 cosine re-rank.
+    const cands = collect.syms.items;
+    var pr = CtxPrint{ .ctx = ctx };
+    _ = dl.dl_vector_rerank_corpus(ctx.db, &corpus, &ivec, cands.ptr, @intCast(cands.len), k, vec_res_cb, &pr);
+}
+
 const SimResult = struct { name: []const u8, sim: f64 };
 const RecentRow = struct { entity: []const u8, updated: []const u8, created: []const u8 };
 
@@ -1174,6 +1292,7 @@ const usage =
     \\  graph
     \\  traverse <start> [depth] [--max-nodes N]
     \\  search "<terms>" [--top N]
+    \\  vsearch "<query>" [--k N] [--radius R]   # semantic search over observation content
     \\  recent [--hours N] [--limit N] [--max-obs N]
     \\  similar <name> [--threshold F]
     \\  delete <name> [<name>...]
@@ -1320,6 +1439,13 @@ pub fn main(init: std.process.Init) void {
         if (pos.items.len < 1) die("error: search needs \"<terms>\"", .{});
         const top: i32 = @intCast(flagI64(cmd_args, "--top", 20));
         cmd_search(&ctx, pos.items[0], top);
+    } else if (std.mem.eql(u8, cmd, "vsearch")) {
+        var pos = positional(cmd_args);
+        defer pos.deinit(alloc);
+        if (pos.items.len < 1) die("error: vsearch needs \"<query>\"", .{});
+        const k: c_int = @intCast(flagI64(cmd_args, "--k", 10));
+        const radius: c_int = @intCast(flagI64(cmd_args, "--radius", 2));
+        cmd_vsearch(&ctx, pos.items[0], k, radius, dbdir);
     } else if (std.mem.eql(u8, cmd, "recent")) {
         const hours = flagI64(cmd_args, "--hours", 24);
         const limit: usize = @intCast(flagI64(cmd_args, "--limit", 20));

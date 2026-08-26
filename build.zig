@@ -19,6 +19,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
     exe.root_module.linkSystemLibrary("datalog", .{});
     exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+    // Find libdatalog.so next to the installed binary (libembed.so is dlopen'd
+    // at runtime via the same dir).
+    exe.root_module.addRPathSpecial("$ORIGIN");
     exe.root_module.link_libc = true;
 
     b.installArtifact(exe);
