@@ -1,7 +1,9 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Default to a portable baseline CPU so binaries run on hosts without the
+    // build machine's AVX2/BMI extensions (e.g. the virgin-media VM host).
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{

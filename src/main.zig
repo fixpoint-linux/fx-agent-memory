@@ -43,6 +43,9 @@ extern fn dl_index_observations(db: ?*anyopaque) c_long;
 extern fn dl_search_top(db: ?*anyopaque, terms: [*c]const u32, n_terms: c_int, obs_ids_out: [*c]u32, scores_out: [*c]c_int, limit: c_int) c_int;
 extern fn dl_query_rules_ro(db: ?*anyopaque, source: [*:0]const u8, goal_rel: [*:0]const u8, cb: ?*const fn ([*c]const u32, u8, ?*anyopaque) callconv(.c) c_int, user: ?*anyopaque) c_long;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern fn fgets(buf: [*c]u8, n: c_int, stream: *anyopaque) [*c]u8;
+extern fn fclose(stream: *anyopaque) c_int;
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn time(timer: ?*c_long) c_long;
 extern fn usleep(usec: c_uint) c_int;
@@ -277,7 +280,45 @@ fn trigram_similarity(alloc: Alloc, a: []const u8, b: []const u8) f64 {
 fn db_path_from_env() []const u8 {
     if (getenv("FX_AGENT_MEMORY_DB")) |v| return std.mem.span(v);
     if (getenv("JING_MEMORY_DB")) |v| return std.mem.span(v);
+    if (config_db_path()) |p| return p;
     return "/home/arch/.jing/memory.dl";
+}
+
+// Resolve the DB path from a config file: first non-empty, non-comment line
+// holds the db dir path. Config file precedence:
+//   $FX_AGENT_MEMORY_CONFIG -> $XDG_CONFIG_HOME/hax/fx-agent-memory
+//   -> ~/.config/hax/fx-agent-memory.
+// The returned slice is allocated on the C allocator (caller keeps it for the
+// process lifetime, which is fine for a CLI). Returns null if unset/unreadable.
+fn config_db_path() ?[]const u8 {
+    var pathbuf: [4096]u8 = undefined;
+    const cfg = if (getenv("FX_AGENT_MEMORY_CONFIG")) |v| std.mem.span(v) else blk: {
+        const xdg = if (getenv("XDG_CONFIG_HOME")) |v| std.mem.span(v) else "/home/arch/.config";
+        const p = std.fmt.bufPrint(&pathbuf, "{s}/hax/fx-agent-memory", .{xdg}) catch return null;
+        break :blk p;
+    };
+
+    var cfgz: [4096]u8 = undefined;
+    @memcpy(cfgz[0..cfg.len], cfg);
+    cfgz[cfg.len] = 0;
+    const f = fopen(@ptrCast(&cfgz), "r") orelse return null;
+    defer _ = fclose(f);
+
+    // Read the first non-empty, non-comment line as the db path.
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const line = fgets(@ptrCast(&buf), @intCast(buf.len), f);
+        if (line == null) break; // EOF or error
+        const len = std.mem.len(line);
+        const n = std.mem.indexOfScalar(u8, line[0..len], '\n') orelse len;
+        const s = std.mem.trim(u8, line[0..n], " \t\r");
+        if (s.len == 0 or s[0] == '#') continue;
+        // Copy into an owned buffer so the slice outlives the C string.
+        const owned = std.heap.c_allocator.alloc(u8, s.len) catch return null;
+        @memcpy(owned, s);
+        return owned;
+    }
+    return null;
 }
 
 // mkdir -p: create every missing path component of `path`.
@@ -299,10 +340,19 @@ fn mkdir_p(path: []const u8) void {
 }
 
 fn open_with_retry(path: []const u8) ?Db {
+    // dl_open takes a C string (NUL-terminated).  path may be a non-sentinel
+    // slice (e.g. from config_db_path's owned allocation), so copy into a
+    // sentinel buffer first — otherwise C reads past the end into garbage.
+    const alloc = std.heap.c_allocator;
+    const pathz = alloc.alloc(u8, path.len + 1) catch return null;
+    defer alloc.free(pathz);
+    @memcpy(pathz[0..path.len], path);
+    pathz[path.len] = 0;
+
     var printed = false;
     var attempt: usize = 0;
     while (attempt < 50) : (attempt += 1) {
-        if (dl.dl_open(path.ptr)) |db| return db;
+        if (dl.dl_open(pathz.ptr)) |db| return db;
         if (!printed) {
             std.debug.print("waiting for memory lock\n", .{});
             printed = true;
@@ -316,15 +366,17 @@ fn open_with_retry(path: []const u8) ?Db {
 // output helpers
 // ---------------------------------------------------------------------------
 // Human-readable output to stdout / stderr. Zig fmt strings, flushed via libc.
+// Format on the heap so arbitrarily long lines (e.g. full observations) are
+// never dropped — a fixed stack buffer would silently discard output >2KB.
 fn emit(comptime fmt: []const u8, args: anytype) void {
-    var buf: [2048]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.fmt.allocPrint(std.heap.c_allocator, fmt, args) catch return;
+    defer std.heap.c_allocator.free(s);
     _ = l.fwrite(s.ptr, 1, s.len, l.stdout);
 }
 
 fn errOut(comptime fmt: []const u8, args: anytype) void {
-    var buf: [2048]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.fmt.allocPrint(std.heap.c_allocator, fmt, args) catch return;
+    defer std.heap.c_allocator.free(s);
     _ = l.fwrite(s.ptr, 1, s.len, l.stderr);
 }
 
@@ -1303,7 +1355,7 @@ const usage =
     \\  query <source-or-file> <goal_rel>   # run arbitrary Datalog rules, print goal tuples
     \\  import <file.jsonl>   # bulk-load NDJSON entities/observations/relations
     \\
-    \\db: $FX_AGENT_MEMORY_DB | $JING_MEMORY_DB | /home/arch/.jing/memory.dl
+    \\db: $FX_AGENT_MEMORY_DB | $JING_MEMORY_DB | config file ($FX_AGENT_MEMORY_CONFIG | $XDG_CONFIG_HOME/hax/fx-agent-memory | ~/.config/hax/fx-agent-memory) | /home/arch/.jing/memory.dl
     \\
 ;
 
