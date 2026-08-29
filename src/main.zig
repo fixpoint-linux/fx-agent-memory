@@ -21,6 +21,9 @@
 //
 // Concurrency: dl_open takes a single-writer lock (returns NULL when held). We
 // retry ~50x at 0.1s, printing "waiting for memory lock" once, then give up.
+// Read-only commands instead open with dl_open_ro (shared F_RDLCK), so any
+// number of readers coexist with each other; only a writer holding the lock
+// makes them wait.
 //
 // dl_index_observations / dl_search_top are exported from libdatalog.so but
 // declared in index.h (which we deliberately do not @cImport). We forward-
@@ -68,9 +71,14 @@ const Alloc = std.mem.Allocator;
 const Ctx = struct {
     db: Db,
     alloc: Alloc,
+    ro: bool = false,
 };
 
 fn intern(ctx: *Ctx, s: []const u8) u32 {
+    // Interning is a write API (returns 0 on a read-only handle), so RO
+    // commands look up instead. 0 is never a valid sym id (1-based), so an
+    // absent name yields an empty prefix/lookup, not a wrong answer.
+    if (ctx.ro) return dl.dl_intern_str_find(ctx.db, s.ptr);
     return dl.dl_intern_str(ctx.db, s.ptr);
 }
 
@@ -82,7 +90,7 @@ fn internz(ctx: *Ctx, s: []const u8) u32 {
     defer ctx.alloc.free(z);
     @memcpy(z[0..s.len], s);
     z[s.len] = 0;
-    return dl.dl_intern_str(ctx.db, z.ptr);
+    return intern(ctx, z);
 }
 
 // NUL-terminated copy of a slice (for C entrypoints that take `const char*`).
@@ -362,6 +370,35 @@ fn open_with_retry(path: []const u8) ?Db {
     return null;
 }
 
+// Read-only open (dl_open_ro): shared F_RDLCK so concurrent readers coexist;
+// never creates the directory or the database. Retries ~50x at 0.1s while a
+// writer holds the lock (err == DL_E_LOCKED); any other error (missing or
+// not-a-database directory) is reported immediately via *err_out (-1).
+fn open_ro(path: []const u8, err_out: *c_int) ?Db {
+    const alloc = std.heap.c_allocator;
+    const pathz = alloc.alloc(u8, path.len + 1) catch {
+        err_out.* = -1;
+        return null;
+    };
+    defer alloc.free(pathz);
+    @memcpy(pathz[0..path.len], path);
+    pathz[path.len] = 0;
+
+    var printed = false;
+    var attempt: usize = 0;
+    while (attempt < 50) : (attempt += 1) {
+        if (dl.dl_open_ro(pathz.ptr, err_out)) |db| return db;
+        if (err_out.* != l.DL_E_LOCKED) return null;
+        if (!printed) {
+            std.debug.print("waiting for memory lock\n", .{});
+            printed = true;
+        }
+        _ = usleep(100_000);
+    }
+    err_out.* = l.DL_E_LOCKED;
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // output helpers
 // ---------------------------------------------------------------------------
@@ -372,6 +409,34 @@ fn emit(comptime fmt: []const u8, args: anytype) void {
     const s = std.fmt.allocPrint(std.heap.c_allocator, fmt, args) catch return;
     defer std.heap.c_allocator.free(s);
     _ = l.fwrite(s.ptr, 1, s.len, l.stdout);
+}
+
+// hax caps tool-output lines at ~500 bytes (OUTPUT_CAP_LINE_WIDTH) and elides
+// the tail of anything longer, so a long observation on one line would be
+// silently truncated before the model sees it. Wrap long content at word
+// boundaries (never mid-word), repeating `prefix` as a continuation indent so
+// every emitted line stays comfortably under that cap.
+fn emit_wrapped(indent: []const u8, content: []const u8) void {
+    const budget: usize = 440; // < hax's 500-byte line cap, leaves room for prefix
+    if (indent.len + content.len <= budget) {
+        emit("{s}{s}\n", .{ indent, content });
+        return;
+    }
+    var i: usize = 0;
+    while (i < content.len) {
+        const cap = @max(budget -| indent.len, 1); // never stall on an over-long indent
+        const take = @min(cap, content.len - i);
+        var j = i + take;
+        // back up to the last space in the window if it would split a word
+        if (i + take < content.len) {
+            var k = j;
+            while (k > i and content[k - 1] != ' ') k -= 1;
+            if (k > i) j = k; // else keep the hard break (single over-long token)
+        }
+        if (j == i) j = i + take;
+        emit("{s}{s}\n", .{ indent, content[i..j] });
+        i = j;
+    }
 }
 
 fn errOut(comptime fmt: []const u8, args: anytype) void {
@@ -589,7 +654,7 @@ fn cmd_read(ctx: *Ctx, names: []const []const u8) void {
         if (obs.items.len == 0) {
             emit("    (none)\n", .{});
         } else for (obs.items) |o| {
-            emit("    - {s}\n", .{o});
+            emit_wrapped("    - ", o);
         }
         emit("  relations:\n", .{});
         var found = false;
@@ -619,15 +684,19 @@ fn cmd_graph(ctx: *Ctx) void {
         const t = std.mem.span(dl.dl_intern_str_of(ctx.db, ebuf.items[i + 1]) orelse continue);
         var obs = observations(ctx, n, 1024);
         defer obs.deinit(ctx.alloc);
-        emit("  {s} ({s})", .{ n, t });
-        if (obs.items.len > 0) {
-            emit(": ", .{});
-            for (obs.items, 0..) |o, idx| {
-                if (idx > 0) emit(" | ", .{});
-                emit("{s}", .{o});
-            }
+        const head = std.fmt.allocPrint(std.heap.c_allocator, "  {s} ({s})", .{ n, t }) catch return;
+        defer std.heap.c_allocator.free(head);
+        if (obs.items.len == 0) {
+            emit("{s}\n", .{head});
+        } else {
+            // join observations, then wrap so the single long line stays under
+            // hax's per-line cap
+            const joined = std.mem.join(std.heap.c_allocator, " | ", obs.items) catch return;
+            defer std.heap.c_allocator.free(joined);
+            const ind = std.fmt.allocPrint(std.heap.c_allocator, "{s}: ", .{head}) catch return;
+            defer std.heap.c_allocator.free(ind);
+            emit_wrapped(ind, joined);
         }
-        emit("\n", .{});
     }
     emit("relations:\n", .{});
     var edges = all_edges(ctx);
@@ -716,7 +785,7 @@ fn vec_res_cb(sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int {
     _ = score;
     const p: *CtxPrint = @ptrCast(@alignCast(user orelse return 1));
     const content = std.mem.span(dl.dl_intern_str_of(p.ctx.db, sym) orelse return 1);
-    emit("{s}\n", .{content});
+    emit_wrapped("", content);
     return 0;
 }
 
@@ -865,7 +934,7 @@ fn cmd_recent(ctx: *Ctx, hours: i64, limit: usize, max_obs: usize) void {
             const content = std.mem.span(dl.dl_intern_str_of(ctx.db, obuf.items[oi + 1]) orelse continue);
             const created = std.mem.span(dl.dl_intern_str_of(ctx.db, obuf.items[oi + 2]) orelse continue);
             if (std.mem.order(u8, created, cutoff) == .gt) {
-                emit("    - {s}\n", .{content});
+                emit_wrapped("    - ", content);
                 shown += 1;
             }
         }
@@ -1402,6 +1471,18 @@ fn positional(args: []const []const u8) std.ArrayListUnmanaged([]const u8) {
     return out;
 }
 
+// Commands that only query the store: they open the db with dl_open_ro so
+// concurrent readers coexist and never queue behind the writer lock.
+// search is deliberately NOT here: it calls dl_index_observations, which
+// writes (txn begin/commit) and would fail on a read-only handle.
+fn is_read_only_cmd(cmd: []const u8) bool {
+    const ro_cmds = [_][]const u8{ "read", "graph", "traverse", "recent", "similar", "count", "rev", "query", "vsearch" };
+    for (ro_cmds) |c| {
+        if (std.mem.eql(u8, cmd, c)) return true;
+    }
+    return false;
+}
+
 pub fn main(init: std.process.Init) void {
     const alloc = std.heap.c_allocator;
     // Convert the runtime argv (sentinel C strings) into []const []const u8.
@@ -1437,17 +1518,26 @@ pub fn main(init: std.process.Init) void {
         return;
     }
 
-    // mkdir -p parent dirs
-    mkdir_p(dbdir);
+    // mkdir -p parent dirs (write commands only — a read-only open never
+    // creates anything and must not leave an empty dir behind)
+    const ro = is_read_only_cmd(rest[0]);
+    if (!ro) mkdir_p(dbdir);
 
-    const db = open_with_retry(dbdir) orelse {
-        std.debug.print("error: could not acquire memory lock on {s}\n", .{dbdir});
+    var open_err: c_int = 0;
+    const db = (if (ro) open_ro(dbdir, &open_err) else open_with_retry(dbdir)) orelse {
+        if (ro and open_err != l.DL_E_LOCKED) {
+            std.debug.print("error: no memory database at {s}\n", .{dbdir});
+        } else {
+            std.debug.print("error: could not acquire memory lock on {s}\n", .{dbdir});
+        }
         std.process.exit(1);
     };
     defer dl.dl_close(db);
 
-    var ctx = Ctx{ .db = db, .alloc = alloc };
-    ensure_relations(&ctx);
+    var ctx = Ctx{ .db = db, .alloc = alloc, .ro = ro };
+    // ensure_relations calls dl_declare_relation (a write API): it would fail
+    // on a read-only handle, and on an existing db the relations already exist.
+    if (!ro) ensure_relations(&ctx);
 
     const cmd = rest[0];
     const cmd_args = rest[1..];
