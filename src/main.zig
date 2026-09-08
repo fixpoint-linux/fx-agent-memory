@@ -285,11 +285,65 @@ fn trigram_similarity(alloc: Alloc, a: []const u8, b: []const u8) f64 {
 // ---------------------------------------------------------------------------
 // db open with single-writer lock retry
 // ---------------------------------------------------------------------------
+// The user's home directory ($HOME). Empty if unset; callers that need a
+// concrete path fall back to a tilde-less absolute only when HOME is absent.
+fn home_dir() []const u8 {
+    if (getenv("HOME")) |h| return std.mem.span(h);
+    return "";
+}
+
+var default_db_buf: [4096]u8 = undefined;
+fn default_db_dir() []const u8 {
+    const home = home_dir();
+    const n = std.fmt.bufPrint(&default_db_buf, "{s}/.jing/memory.dl", .{home}) catch return ".jing/memory.dl";
+    return n;
+}
+
 fn db_path_from_env() []const u8 {
     if (getenv("FX_AGENT_MEMORY_DB")) |v| return std.mem.span(v);
     if (getenv("JING_MEMORY_DB")) |v| return std.mem.span(v);
     if (config_db_path()) |p| return p;
-    return "/home/arch/.jing/memory.dl";
+    return default_db_dir();
+}
+
+// Expand a config-file db path: a leading "~" becomes the user's home, and
+// $VAR / ${VAR} references are read from the environment (notably $HOME), so
+// a portable "$HOME/.config/hax/memory.dl" line resolves on any host. Returns
+// an owned allocation (caller keeps it for the process lifetime, like the
+// raw-config value it replaces) or null on OOM.
+fn expand_cfg_path(alloc: Alloc, raw: []const u8) ?[]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < raw.len) {
+        const c = raw[i];
+        if (c == '~' and i == 0) {
+            const home = home_dir();
+            out.appendSlice(alloc, home) catch return null;
+            i += 1;
+        } else if (c == '$') {
+            var j = i + 1;
+            const braced = (j < raw.len and raw[j] == '{');
+            if (braced) j += 1;
+            const vstart = j;
+            while (j < raw.len and (std.ascii.isAlphanumeric(raw[j]) or raw[j] == '_')) j += 1;
+            const vname = raw[vstart..j];
+            if (vname.len > 0) {
+                var namez: [256]u8 = undefined;
+                if (vname.len < namez.len) {
+                    @memcpy(namez[0..vname.len], vname);
+                    namez[vname.len] = 0;
+                    if (getenv(@ptrCast(&namez))) |val| out.appendSlice(alloc, std.mem.span(val)) catch return null;
+                }
+            }
+            i = if (braced and j < raw.len and raw[j] == '}') j + 1 else j;
+        } else {
+            out.append(alloc, c) catch return null;
+            i += 1;
+        }
+    }
+    const owned = alloc.dupe(u8, out.items) catch return null;
+    return owned;
 }
 
 // Resolve the DB path from a config file: first non-empty, non-comment line
@@ -301,7 +355,7 @@ fn db_path_from_env() []const u8 {
 fn config_db_path() ?[]const u8 {
     var pathbuf: [4096]u8 = undefined;
     const cfg = if (getenv("FX_AGENT_MEMORY_CONFIG")) |v| std.mem.span(v) else blk: {
-        const xdg = if (getenv("XDG_CONFIG_HOME")) |v| std.mem.span(v) else "/home/arch/.config";
+        const xdg = if (getenv("XDG_CONFIG_HOME")) |v| std.mem.span(v) else default_config_dir();
         const p = std.fmt.bufPrint(&pathbuf, "{s}/hax/fx-agent-memory", .{xdg}) catch return null;
         break :blk p;
     };
@@ -321,6 +375,8 @@ fn config_db_path() ?[]const u8 {
         const n = std.mem.indexOfScalar(u8, line[0..len], '\n') orelse len;
         const s = std.mem.trim(u8, line[0..n], " \t\r");
         if (s.len == 0 or s[0] == '#') continue;
+        // Expand "~" / "$HOME" (etc.) so a portable config line works anywhere.
+        if (expand_cfg_path(std.heap.c_allocator, s)) |owned| return owned;
         // Copy into an owned buffer so the slice outlives the C string.
         const owned = std.heap.c_allocator.alloc(u8, s.len) catch return null;
         @memcpy(owned, s);
@@ -328,6 +384,16 @@ fn config_db_path() ?[]const u8 {
     }
     return null;
 }
+
+// $XDG_CONFIG_HOME default: $HOME/.config (the XDG spec). Home-derived so the
+// binary is portable across hosts, not baked to a build-time user.
+fn default_config_dir() []const u8 {
+    const home = home_dir();
+    if (home.len == 0) return "/.config";
+    const n = std.fmt.bufPrint(&config_dir_buf, "{s}/.config", .{home}) catch return "/.config";
+    return n;
+}
+var config_dir_buf: [4096]u8 = undefined;
 
 // mkdir -p: create every missing path component of `path`.
 fn mkdir_p(path: []const u8) void {
@@ -1424,7 +1490,7 @@ const usage =
     \\  query <source-or-file> <goal_rel>   # run arbitrary Datalog rules, print goal tuples
     \\  import <file.jsonl>   # bulk-load NDJSON entities/observations/relations
     \\
-    \\db: $FX_AGENT_MEMORY_DB | $JING_MEMORY_DB | config file ($FX_AGENT_MEMORY_CONFIG | $XDG_CONFIG_HOME/hax/fx-agent-memory | ~/.config/hax/fx-agent-memory) | /home/arch/.jing/memory.dl
+    \\db: $FX_AGENT_MEMORY_DB | $JING_MEMORY_DB | config file ($FX_AGENT_MEMORY_CONFIG | $XDG_CONFIG_HOME/hax/fx-agent-memory | ~/.config/hax/fx-agent-memory) | $HOME/.jing/memory.dl
     \\
 ;
 
