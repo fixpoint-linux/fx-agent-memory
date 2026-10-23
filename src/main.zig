@@ -25,7 +25,7 @@
 // number of readers coexist with each other; only a writer holding the lock
 // makes them wait.
 //
-// dl_index_observations / dl_search_top are exported from libdatalog.so but
+// dl_index_observations / dl_search_ranked_top are exported from libdatalog.so but
 // declared in index.h (which we deliberately do not @cImport). We forward-
 // declare them ourselves below. Term tokenization (split on non-alphanumeric,
 // lowercase) is mirrored here from index.c.
@@ -43,7 +43,27 @@ const dl = l;
 // extern forward declarations for the index.h search entrypoints.
 // ---------------------------------------------------------------------------
 extern fn dl_index_observations(db: ?*anyopaque) c_long;
-extern fn dl_search_top(db: ?*anyopaque, terms: [*c]const u32, n_terms: c_int, obs_ids_out: [*c]u32, scores_out: [*c]c_int, limit: c_int) c_int;
+// Partial-match search: a document qualifies when it holds >= min_terms of the
+// query's DISTINCT terms, ranked by how many it matched (score desc, id asc).
+// The AND-only dl_search_top it replaces needs every term in one document, so a
+// natural-language query returns nothing.
+extern fn dl_search_ranked_top(db: ?*anyopaque, terms: [*c]const u32, n_terms: c_int, min_terms: c_int, obs_ids_out: [*c]u32, scores_out: [*c]c_int, limit: c_int) c_int;
+
+// The vector tier's ABI, declared here because the engine REMOVED the types from
+// its public headers while keeping both entry points as -1 shims at the symbol
+// level (so a pre-removal consumer still LOADS). vsearch therefore compiles
+// against this local declaration and fails at runtime with "vector search
+// failed" — exactly the behaviour of the binary it replaces.
+const VecCorpus = extern struct {
+    filter_rel: [*:0]const u8,
+    filter_col: u8,
+    sig_rel_fmt: [*:0]const u8,
+    vec_rel: [*:0]const u8,
+    basis_suffix: [*:0]const u8,
+};
+const VecCb = *const fn (sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int;
+extern fn dl_vector_search_corpus(db: ?*anyopaque, corpus: *const VecCorpus, q_int8: [*c]const u32, k: c_int, radius: c_int, cb: ?VecCb, user: ?*anyopaque) c_long;
+extern fn dl_vector_rerank_corpus(db: ?*anyopaque, corpus: *const VecCorpus, q_int8: [*c]const u32, cand_syms: [*c]const u32, n_cand: c_int, k: c_int, cb: ?VecCb, user: ?*anyopaque) c_long;
 extern fn dl_query_rules_ro(db: ?*anyopaque, source: [*:0]const u8, goal_rel: [*:0]const u8, cb: ?*const fn ([*c]const u32, u8, ?*anyopaque) callconv(.c) c_int, user: ?*anyopaque) c_long;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
@@ -794,7 +814,7 @@ fn cmd_traverse(ctx: *Ctx, start: []const u8, depth: i32, max_nodes: i32) void {
     }
 }
 
-fn cmd_search(ctx: *Ctx, terms: []const u8, top: i32) void {
+fn cmd_search(ctx: *Ctx, terms: []const u8, top: i32, min_terms_opt: ?i32) void {
     _ = dl_index_observations(@ptrCast(ctx.db));
     var tokens = tokenize(ctx.alloc, terms);
     defer {
@@ -808,12 +828,36 @@ fn cmd_search(ctx: *Ctx, terms: []const u8, top: i32) void {
     defer ctx.alloc.free(alloced);
     for (tokens.items, 0..) |t, idx| alloced[idx] = intern(ctx, t);
 
+    // min_terms counts DISTINCT terms: the engine dedups the sym_ids it is
+    // handed and rejects min_terms > n_distinct as a caller bug (-1), so a
+    // repeated token must not raise the threshold past what a document can
+    // reach. Default is half the distinct terms (5 -> 2, 3 -> 1, 1 -> 1): a long
+    // natural-language query matches partially instead of returning nothing,
+    // ranked so the documents holding most of the terms come first. 1 term is
+    // unchanged; 2 terms become OR (MEASURED: "secure boot" 4 rows -> >800), so
+    // a caller that wants the AND set there passes --min-terms 2.
+    var n_distinct: i32 = 0;
+    for (alloced, 0..) |sym, i| {
+        var dup = false;
+        for (alloced[0..i]) |prev| {
+            if (prev == sym) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) n_distinct += 1;
+    }
+    const min_terms: i32 = min_terms_opt orelse @max(1, @divTrunc(n_distinct, 2));
+    if (min_terms < 1) die("error: --min-terms must be >= 1", .{});
+    if (min_terms > n_distinct)
+        die("error: --min-terms {d} exceeds the {d} distinct search term(s)", .{ min_terms, n_distinct });
+
     const obs_out = ctx.alloc.alloc(u32, @intCast(top)) catch die("oom", .{});
     defer ctx.alloc.free(obs_out);
     const scores_out = ctx.alloc.alloc(c_int, @intCast(top)) catch die("oom", .{});
     defer ctx.alloc.free(scores_out);
 
-    const rc = dl_search_top(@ptrCast(ctx.db), alloced.ptr, @intCast(tokens.items.len), obs_out.ptr, scores_out.ptr, top);
+    const rc = dl_search_ranked_top(@ptrCast(ctx.db), alloced.ptr, @intCast(tokens.items.len), min_terms, obs_out.ptr, scores_out.ptr, top);
     if (rc < 0) die("error: search failed", .{});
     var i: c_int = 0;
     while (i < rc) : (i += 1) {
@@ -918,7 +962,7 @@ fn cmd_vsearch(ctx: *Ctx, query: []const u8, k: c_int, radius: c_int, dbdir: []c
     if (rc != 0) die("error: {s}", .{std.mem.sliceTo(@as([*:0]const u8, &errbuf), 0)});
 
     // content corpus descriptor (built in Zig — the C macros don't translate).
-    const corpus = dl.struct_dl_vec_corpus{
+    const corpus = VecCorpus{
         .filter_rel = "observation",
         .filter_col = 1,
         .sig_rel_fmt = "__obssig%d__",
@@ -929,14 +973,14 @@ fn cmd_vsearch(ctx: *Ctx, query: []const u8, k: c_int, radius: c_int, dbdir: []c
     // (1) candidate retrieval.
     var collect = CandCollect{ .syms = .empty };
     defer collect.syms.deinit(ctx.alloc);
-    const n_cand = dl.dl_vector_search_corpus(ctx.db, &corpus, &sig, k * 10, radius, vec_cand_cb, &collect);
+    const n_cand = dl_vector_search_corpus(ctx.db, &corpus, &sig, k * 10, radius, vec_cand_cb, &collect);
     if (n_cand < 0) die("error: vector search failed", .{});
     if (n_cand == 0) return;
 
     // (2) int8 cosine re-rank.
     const cands = collect.syms.items;
     var pr = CtxPrint{ .ctx = ctx };
-    _ = dl.dl_vector_rerank_corpus(ctx.db, &corpus, &ivec, cands.ptr, @intCast(cands.len), k, vec_res_cb, &pr);
+    _ = dl_vector_rerank_corpus(ctx.db, &corpus, &ivec, cands.ptr, @intCast(cands.len), k, vec_res_cb, &pr);
 }
 
 const SimResult = struct { name: []const u8, sim: f64 };
@@ -1478,7 +1522,9 @@ const usage =
     \\  read <name> [<name>...]
     \\  graph
     \\  traverse <start> [depth] [--max-nodes N]
-    \\  search "<terms>" [--top N]
+    \\  search "<terms>" [--top N] [--min-terms N]
+    \\      # partial match: a row needs >= N of the distinct terms (default max(1, n/2)),
+    \\      # ranked by how many it matched. --min-terms N overrides; N = n is AND.
     \\  vsearch "<query>" [--k N] [--radius R]   # semantic search over observation content
     \\  recent [--hours N] [--limit N] [--max-obs N]
     \\  similar <name> [--threshold F]
@@ -1525,7 +1571,7 @@ fn flagF64(args: []const []const u8, flag: []const u8, def: f64) f64 {
 fn positional(args: []const []const u8) std.ArrayListUnmanaged([]const u8) {
     var out = std.ArrayListUnmanaged([]const u8).empty;
     var i: usize = 0;
-    const flags = [_][]const u8{ "--type", "--from", "--to", "--max-nodes", "--top", "--hours", "--limit", "--max-obs", "--threshold" };
+    const flags = [_][]const u8{ "--type", "--from", "--to", "--max-nodes", "--top", "--min-terms", "--hours", "--limit", "--max-obs", "--threshold" };
     while (i < args.len) : (i += 1) {
         var skip = false;
         for (flags) |f| {
@@ -1646,7 +1692,11 @@ pub fn main(init: std.process.Init) void {
         defer pos.deinit(alloc);
         if (pos.items.len < 1) die("error: search needs \"<terms>\"", .{});
         const top: i32 = @intCast(flagI64(cmd_args, "--top", 20));
-        cmd_search(&ctx, pos.items[0], top);
+        const min_terms: ?i32 = if (flagValue(cmd_args, "--min-terms")) |v|
+            @intCast(parseI64(v) orelse die("error: --min-terms needs a number", .{}))
+        else
+            null;
+        cmd_search(&ctx, pos.items[0], top, min_terms);
     } else if (std.mem.eql(u8, cmd, "vsearch")) {
         var pos = positional(cmd_args);
         defer pos.deinit(alloc);
