@@ -46,7 +46,7 @@ fx-agent-memory [--db <dir>|-d <dir>] <command> [args]
   read <name> [<name>...]
   graph
   traverse <start> [depth] [--max-nodes N]
-  search "<terms>" [--top N]
+  search "<terms>" [--top N] [--min-terms N]
   vsearch "<query>" [--k N] [--radius R]   # semantic search over observation content
   recent [--hours N] [--limit N] [--max-obs N]
   similar <name> [--threshold F]
@@ -73,7 +73,10 @@ deliberately *not* read-only — it calls `dl_index_observations`, which writes.
 
 **Search:**
 - `search` — lexical full-text over observation content (term tokenization and
-  `dl_search_top` scoring).
+  `dl_search_top` scoring). `--min-terms N` makes it a partial match: a row needs
+  N of the distinct terms. Default N is all of them for a 1-2 term query (AND),
+  else `ceil(3n/5)` (3→2, 4→3, 5→3, 6→4) so a long natural-language query matches
+  partially instead of returning nothing.
 - `vsearch` — semantic (embedding) search over observation content via
   `libembed.so`, restricted to entities within a graph radius of the match.
 

@@ -814,6 +814,15 @@ fn cmd_traverse(ctx: *Ctx, start: []const u8, depth: i32, max_nodes: i32) void {
     }
 }
 
+// Default partial-match threshold, a function of the DISTINCT query terms:
+// a 1-2 term query keeps AND (n_distinct), so the common short agent query
+// stays exact; beyond that a supermajority of the terms is required —
+// ceil(3*n/5), floored at 2 (3 -> 2, 4 -> 3, 5 -> 3, 6 -> 4, 8 -> 5).
+fn defaultMinTerms(n_distinct: i32) i32 {
+    if (n_distinct <= 2) return n_distinct;
+    return @max(2, @divTrunc(3 * n_distinct + 4, 5)); // (3n+4)/5 == ceil(3n/5)
+}
+
 fn cmd_search(ctx: *Ctx, terms: []const u8, top: i32, min_terms_opt: ?i32) void {
     _ = dl_index_observations(@ptrCast(ctx.db));
     var tokens = tokenize(ctx.alloc, terms);
@@ -826,16 +835,23 @@ fn cmd_search(ctx: *Ctx, terms: []const u8, top: i32, min_terms_opt: ?i32) void 
     }
     const alloced = ctx.alloc.alloc(u32, tokens.items.len) catch die("oom", .{});
     defer ctx.alloc.free(alloced);
-    for (tokens.items, 0..) |t, idx| alloced[idx] = intern(ctx, t);
+    // Token slices are not NUL-terminated (lower() dupes an exact-length
+    // buffer) and dl_intern_str reads a C string, so a bare intern() here
+    // interns the term PLUS whatever heap bytes follow it: MEASURED, every
+    // 3-letter term ("mok", "zfs", "nfs") matched nothing while the engine
+    // returned 7/100/100 rows for the same terms.
+    for (tokens.items, 0..) |t, idx| alloced[idx] = internz(ctx, t);
 
     // min_terms counts DISTINCT terms: the engine dedups the sym_ids it is
     // handed and rejects min_terms > n_distinct as a caller bug (-1), so a
     // repeated token must not raise the threshold past what a document can
-    // reach. Default is half the distinct terms (5 -> 2, 3 -> 1, 1 -> 1): a long
-    // natural-language query matches partially instead of returning nothing,
-    // ranked so the documents holding most of the terms come first. 1 term is
-    // unchanged; 2 terms become OR (MEASURED: "secure boot" 4 rows -> >800), so
-    // a caller that wants the AND set there passes --min-terms 2.
+    // reach. Default: a SHORT query keeps AND (1 -> 1, 2 -> 2), so the very
+    // common 2-term agent query does not silently turn into OR (MEASURED:
+    // "secure boot" AND 4 rows -> OR 100+, the --top cap). A LONG
+    // natural-language query instead requires a supermajority of its distinct
+    // terms, which is what stops it returning nothing while staying precise
+    // (MEASURED "nvidia secure boot MOK kernel": 3 of 5 -> 4 rows, 2 of 5 ->
+    // 100+). --min-terms N overrides either way; N = n_distinct is AND.
     var n_distinct: i32 = 0;
     for (alloced, 0..) |sym, i| {
         var dup = false;
@@ -847,7 +863,7 @@ fn cmd_search(ctx: *Ctx, terms: []const u8, top: i32, min_terms_opt: ?i32) void 
         }
         if (!dup) n_distinct += 1;
     }
-    const min_terms: i32 = min_terms_opt orelse @max(1, @divTrunc(n_distinct, 2));
+    const min_terms: i32 = min_terms_opt orelse defaultMinTerms(n_distinct);
     if (min_terms < 1) die("error: --min-terms must be >= 1", .{});
     if (min_terms > n_distinct)
         die("error: --min-terms {d} exceeds the {d} distinct search term(s)", .{ min_terms, n_distinct });
@@ -1523,8 +1539,9 @@ const usage =
     \\  graph
     \\  traverse <start> [depth] [--max-nodes N]
     \\  search "<terms>" [--top N] [--min-terms N]
-    \\      # partial match: a row needs >= N of the distinct terms (default max(1, n/2)),
-    \\      # ranked by how many it matched. --min-terms N overrides; N = n is AND.
+    \\      # partial match: a row needs >= N of the distinct terms, ranked by how
+    \\      # many it matched. Default N: all of them for 1-2 terms (AND), else
+    \\      # ceil(3n/5) (3->2, 4->3, 5->3, 6->4). --min-terms N overrides; N = n is AND.
     \\  vsearch "<query>" [--k N] [--radius R]   # semantic search over observation content
     \\  recent [--hours N] [--limit N] [--max-obs N]
     \\  similar <name> [--threshold F]
