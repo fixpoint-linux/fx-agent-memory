@@ -65,6 +65,9 @@ const VecCb = *const fn (sym: u32, score: c_int, user: ?*anyopaque) callconv(.c)
 extern fn dl_vector_search_corpus(db: ?*anyopaque, corpus: *const VecCorpus, q_int8: [*c]const u32, k: c_int, radius: c_int, cb: ?VecCb, user: ?*anyopaque) c_long;
 extern fn dl_vector_rerank_corpus(db: ?*anyopaque, corpus: *const VecCorpus, q_int8: [*c]const u32, cand_syms: [*c]const u32, n_cand: c_int, k: c_int, cb: ?VecCb, user: ?*anyopaque) c_long;
 extern fn dl_query_rules_ro(db: ?*anyopaque, source: [*:0]const u8, goal_rel: [*:0]const u8, cb: ?*const fn ([*c]const u32, u8, ?*anyopaque) callconv(.c) c_int, user: ?*anyopaque) c_long;
+// Well-founded semantics (van Gelder alternating fixpoint): the only entry
+// point that answers a program with negation through a recursion cycle.
+extern fn dl_query_wfs_ro(db: ?*anyopaque, source: [*:0]const u8, goal_rel: [*:0]const u8, truth: c_int, cb: ?*const fn ([*c]const u32, u8, ?*anyopaque) callconv(.c) c_int, user: ?*anyopaque) c_long;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern fn fgets(buf: [*c]u8, n: c_int, stream: *anyopaque) [*c]u8;
@@ -137,18 +140,27 @@ fn del_fact(ctx: *Ctx, rel: []const u8, cols: []const u32) void {
 }
 
 fn rev_get(ctx: *Ctx, name: []const u8) u32 {
+    // dl_rev_get takes a C string; `name` is not necessarily NUL-terminated
+    // (e.g. a JSON-parser-owned value), and reading past it looks up a
+    // different name and reports rev 0.
+    const z = zdup(ctx, name);
+    defer ctx.alloc.free(z);
     var out: u32 = 0;
-    _ = dl.dl_rev_get(ctx.db, name.ptr, &out);
+    _ = dl.dl_rev_get(ctx.db, z.ptr, &out);
     return out;
 }
 
 fn rev_bump(ctx: *Ctx, name: []const u8) void {
     // optimistic concurrency: reread + retry on conflict, so a concurrent
     // writer bumping the rev between our read and CAS is never lost.
+    // dl_cas_revision takes a C string, so terminate it (same class as
+    // rev_get: a JSON- or file-buffer-backed name would read past its end).
+    const z = zdup(ctx, name);
+    defer ctx.alloc.free(z);
     var attempts: usize = 0;
     while (true) {
         const cur = rev_get(ctx, name);
-        const rc = dl.dl_cas_revision(ctx.db, name.ptr, cur, cur + 1);
+        const rc = dl.dl_cas_revision(ctx.db, z.ptr, cur, cur + 1);
         if (rc == 0) return;
         if (rc < 0) die("error: CAS revision failed for '{s}'", .{name});
         // DL_E_CONFLICT
@@ -602,19 +614,8 @@ fn cmd_add_obs(ctx: *Ctx, name: []const u8, contents: []const []const u8) void {
                 die("error: CAS revision failed for '{s}'", .{name});
             }
         }
-        // bump updated_at to now
-        {
-            var cur = prefix(ctx, "entity_ts", &.{namesym}, 1);
-            defer cur.deinit(ctx.alloc);
-            if (cur.items.len >= 2) {
-                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
-                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
-                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
-                    _ = dl.dl_txn_rollback(ctx.db);
-                    die("error: cannot update entity_ts", .{});
-                }
-            }
-        }
+        // bump updated_at to now (created_at is preserved)
+        txn_refresh_entity_ts(ctx, namesym, null, nowsym);
         const rc = dl.dl_txn_commit(ctx.db);
         if (rc == 0) return;
         _ = dl.dl_txn_rollback(ctx.db);
@@ -642,30 +643,8 @@ fn cmd_relate(ctx: *Ctx, a: []const u8, b: []const u8, rel: []const u8) void {
             _ = dl.dl_txn_rollback(ctx.db);
             die("error: cannot add edge fact", .{});
         }
-        {
-            var cur = prefix(ctx, "entity_ts", &.{asym}, 1);
-            defer cur.deinit(ctx.alloc);
-            if (cur.items.len >= 2) {
-                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
-                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
-                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
-                    _ = dl.dl_txn_rollback(ctx.db);
-                    die("error: cannot update entity_ts", .{});
-                }
-            }
-        }
-        {
-            var cur = prefix(ctx, "entity_ts", &.{bsym}, 1);
-            defer cur.deinit(ctx.alloc);
-            if (cur.items.len >= 2) {
-                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
-                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
-                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
-                    _ = dl.dl_txn_rollback(ctx.db);
-                    die("error: cannot update entity_ts", .{});
-                }
-            }
-        }
+        txn_refresh_entity_ts(ctx, asym, null, nowsym);
+        txn_refresh_entity_ts(ctx, bsym, null, nowsym);
         const ra = rev_get(ctx, a);
         if (dl.dl_txn_cas(ctx.db, a.ptr, ra, ra + 1) != 0) {
             _ = dl.dl_txn_rollback(ctx.db);
@@ -699,12 +678,49 @@ fn bump_updated_at(ctx: *Ctx, name: []const u8, ts: []const u8) void {
 }
 
 fn entity_type(ctx: *Ctx, name: []const u8) ?[]const u8 {
-    var cur = prefix(ctx, "entity", &.{intern(ctx, name)}, 1);
+    // intern() reads a C string, so a non-terminated `name` (a JSON value, a
+    // file-buffer slice) would intern "name<garbage>" and find nothing.
+    const z = zdup(ctx, name);
+    defer ctx.alloc.free(z);
+    var cur = prefix(ctx, "entity", &.{intern(ctx, z)}, 1);
     defer cur.deinit(ctx.alloc);
     if (cur.items.len >= 2) {
         return std.mem.span(dl.dl_intern_str_of(ctx.db, cur.items[1]) orelse return null);
     }
     return null;
+}
+
+// Replace an entity's entity_ts row inside the current transaction.
+//
+// A store damaged by the old import bug can hold SEVERAL stacked rows for one
+// entity, so EVERY row is deleted and exactly one is written (deleting only the
+// first left the store half-repaired).
+//
+// `created_in` / `updated_in` are null when the caller has no new value: the
+// recorded column is then preserved rather than overwritten with an empty
+// symbol (cmd_add_obs's policy — it deliberately keeps created_at). With no
+// existing row and no created_in there is no created_at to record, so nothing
+// is written.
+fn txn_refresh_entity_ts(ctx: *Ctx, namesym: u32, created_in: ?u32, updated_in: ?u32) void {
+    var cur = prefix(ctx, "entity_ts", &.{namesym}, 1);
+    defer cur.deinit(ctx.alloc);
+    var created: u32 = created_in orelse 0;
+    var updated: u32 = updated_in orelse 0;
+    var k: usize = 0;
+    while (k + 3 <= cur.items.len) : (k += 3) {
+        if (created == 0) created = cur.items[k + 1];
+        if (updated == 0) updated = cur.items[k + 2];
+        if (dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[k..][0..3].ptr, 3) != 0) {
+            _ = dl.dl_txn_rollback(ctx.db);
+            die("error: cannot update entity_ts", .{});
+        }
+    }
+    if (created == 0 or updated == 0) return; // nothing recorded, nothing supplied
+    var ucols: [3]u32 = .{ namesym, created, updated };
+    if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
+        _ = dl.dl_txn_rollback(ctx.db);
+        die("error: cannot update entity_ts", .{});
+    }
 }
 
 fn require_entity(ctx: *Ctx, name: []const u8) void {
@@ -1151,30 +1167,8 @@ fn cmd_del_rel(ctx: *Ctx, a: []const u8, b: []const u8, rel: []const u8) void {
             _ = dl.dl_txn_rollback(ctx.db);
             die("error: cannot delete edge fact", .{});
         }
-        {
-            var cur = prefix(ctx, "entity_ts", &.{asym}, 1);
-            defer cur.deinit(ctx.alloc);
-            if (cur.items.len >= 2) {
-                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
-                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
-                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
-                    _ = dl.dl_txn_rollback(ctx.db);
-                    die("error: cannot update entity_ts", .{});
-                }
-            }
-        }
-        {
-            var cur = prefix(ctx, "entity_ts", &.{bsym}, 1);
-            defer cur.deinit(ctx.alloc);
-            if (cur.items.len >= 2) {
-                _ = dl.dl_txn_delete_fact(ctx.db, "entity_ts", cur.items[0..3], 3);
-                var ucols: [3]u32 = .{ cur.items[0], cur.items[1], nowsym };
-                if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ucols, 3) != 0) {
-                    _ = dl.dl_txn_rollback(ctx.db);
-                    die("error: cannot update entity_ts", .{});
-                }
-            }
-        }
+        txn_refresh_entity_ts(ctx, asym, null, nowsym);
+        txn_refresh_entity_ts(ctx, bsym, null, nowsym);
         const ra = rev_get(ctx, a);
         if (dl.dl_txn_cas(ctx.db, a.ptr, ra, ra + 1) != 0) {
             _ = dl.dl_txn_rollback(ctx.db);
@@ -1208,6 +1202,73 @@ fn cmd_count(ctx: *Ctx, rel: []const u8) void {
     emit("{s}: {d}\n", .{ rel, n });
 }
 
+// Relations the CLI itself owns: a user relation with one of these names would
+// collide with the store's bookkeeping, so declare refuses them.
+fn is_builtin_rel(name: []const u8) bool {
+    const builtins = [_][]const u8{ "entity", "entity_ts", "observation", "obs_ts", "edge", "rev" };
+    for (builtins) |b| if (std.mem.eql(u8, name, b)) return true;
+    return false;
+}
+
+// declare <rel> <arity>: expose dl_declare_relation so a consumer can namespace
+// its own attributes instead of overloading edge/3. Idempotent on the same
+// arity; a mismatch is a specific error (the engine returns the same -1 for a
+// mismatch and for a failed open, so the recorded arity is read from rels.txt).
+fn cmd_declare(ctx: *Ctx, dbdir: []const u8, name: []const u8, arity_arg: []const u8) void {
+    // The engine's rels.txt round-trip is getline + FIRST-colon based and
+    // copies each name through snprintf into a 256-byte buffer (dl.zig:1108
+    // loader array, 1162 snprintf) — so a name holding a newline splits into a
+    // phantom relation on reopen, and one over 255 bytes is silently truncated.
+    // Tighter still: dl_declare_relation opens "<dbdir>/<name>.wal"
+    // (makePath, dl.zig:541), and a filename COMPONENT is capped at 255 bytes
+    // (NAME_MAX), so name + 4 <= 255. MEASURED on tmpfs: a 251-byte name
+    // declares, 252 fails (ENAMETOOLONG). Names are therefore restricted to
+    // 1-251 bytes with no whitespace, no control characters and no ':'.
+    if (name.len == 0 or name.len > 251)
+        die("error: invalid relation name (length {d}; must be 1-251 bytes)", .{name.len});
+    for (name) |c| {
+        if (c <= 0x20 or c == 0x7f or c == ':')
+            die("error: invalid relation name (no whitespace, control characters or ':')", .{});
+    }
+    if (is_builtin_rel(name))
+        die("error: '{s}' is a built-in relation (entity, entity_ts, observation, obs_ts, edge, rev)", .{name});
+    const arity_i = parseI64(arity_arg) orelse die("error: declare needs a numeric arity (0 = variadic, 1-8)", .{});
+    if (arity_i < 0 or arity_i > 8)
+        die("error: arity must be 0 (variadic) or 1-8, got {d}", .{arity_i});
+    const arity: u8 = @intCast(arity_i);
+    if (rel_arity(ctx, dbdir, name)) |declared| {
+        if (declared == arity) {
+            emit("relation '{s}' already declared with arity {d}\n", .{ name, arity });
+            return;
+        }
+        die("error: relation '{s}' is already declared with arity {d}, cannot redeclare with arity {d}", .{ name, declared, arity });
+    }
+    const zname = zdup(ctx, name);
+    defer ctx.alloc.free(zname);
+    if (dl.dl_declare_relation(ctx.db, zname.ptr, arity) != 0)
+        die("error: cannot declare relation '{s}' with arity {d}", .{ name, arity });
+    emit("declared '{s}' arity {d}\n", .{ name, arity });
+}
+
+const FactsPrinter = struct { ctx: *Ctx };
+
+fn facts_cb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+    const p: *FactsPrinter = @ptrCast(@alignCast(user.?));
+    emit_cols(p.ctx, cols[0..arity]);
+    return 0;
+}
+
+// facts <rel>: dump a relation's tuples with the same rendering policy as
+// query output (emit_cols). The arity comes from each tuple, so this works for
+// variadic relations too.
+fn cmd_facts(ctx: *Ctx, rel: []const u8) void {
+    const zrel = zdup(ctx, rel);
+    defer ctx.alloc.free(zrel);
+    var p = FactsPrinter{ .ctx = ctx };
+    if (dl.dl_prefix(ctx.db, zrel.ptr, null, 0, facts_cb, &p) < 0)
+        die("error: unknown relation '{s}'", .{rel});
+}
+
 const QueryPrinter = struct {
     ctx: *Ctx,
     count: usize = 0,
@@ -1215,15 +1276,29 @@ const QueryPrinter = struct {
 
 fn query_cb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     const q: *QueryPrinter = @ptrCast(@alignCast(user.?));
-    var i: usize = 0;
-    while (i < arity) : (i += 1) {
-        const s = std.mem.span(dl.dl_intern_str_of(q.ctx.db, cols[i]) orelse continue);
-        if (i > 0) emit(" ", .{});
-        emit("{s}", .{s});
-    }
-    emit("\n", .{});
+    emit_cols(q.ctx, cols[0..arity]);
     q.count += 1;
     return 0;
+}
+
+// Render one tuple, space-separated, one line. A column whose value does not
+// resolve to a symbol is a raw integer: print it as a number. Never drop a
+// column — the old `orelse continue` silently shortened the row, and the
+// separator logic then produced a leading space. Note the engine's documented
+// one-space design: an int whose value equals a live symbol id renders as that
+// symbol (the interner is 1-based and shares the u32 range); the encoding is
+// not changed here.
+fn emit_cols(ctx: *Ctx, cols: []const u32) void {
+    var i: usize = 0;
+    while (i < cols.len) : (i += 1) {
+        if (i > 0) emit(" ", .{});
+        if (dl.dl_intern_str_of(ctx.db, cols[i])) |s| {
+            emit("{s}", .{std.mem.span(s)});
+        } else {
+            emit("{d}", .{cols[i]});
+        }
+    }
+    emit("\n", .{});
 }
 
 fn cmd_query(ctx: *Ctx, source: []const u8, goal_rel: []const u8) void {
@@ -1256,7 +1331,17 @@ fn cmd_query(ctx: *Ctx, source: []const u8, goal_rel: []const u8) void {
     // Read-only evaluation: the engine runs the rules against an internal
     // clone of the store, so nothing is persisted and no relation is added.
     var q = QueryPrinter{ .ctx = ctx };
-    const n = dl_query_rules_ro(@ptrCast(ctx.db), @ptrCast(zsrc.ptr), @ptrCast(goal_rel.ptr), query_cb, &q);
+    var n = dl_query_rules_ro(@ptrCast(ctx.db), @ptrCast(zsrc.ptr), @ptrCast(goal_rel.ptr), query_cb, &q);
+    if (n < 0) {
+        // The stratified evaluator rejects negation through a recursion cycle
+        // ("unstratifiable program") — exactly the class the well-founded
+        // (van Gelder alternating fixpoint) entry point answers. Fall back, do
+        // not replace: WFS slice 1 rejects negated EDB atoms, builtins,
+        // aggregates, arithmetic and variadic relations, so making it the
+        // primary evaluator would regress valid programs.
+        q.count = 0;
+        n = dl_query_wfs_ro(@ptrCast(ctx.db), @ptrCast(zsrc.ptr), @ptrCast(goal_rel.ptr), l.DL_WFS_TRUE_ONLY, query_cb, &q);
+    }
     if (n < 0) die("error: query failed", .{});
     if (q.count == 0) emit("(no results)\n", .{});
 }
@@ -1268,10 +1353,29 @@ fn cmd_query(ctx: *Ctx, source: []const u8, goal_rel: []const u8) void {
 // string values are stored unescaped (owned), numbers as raw slices (owned by
 // the input buffer) flagged via `nums`. Enough JSON for NDJSON: objects,
 // escaped strings, numbers, and the literals true/false/null (ignored).
+// One scalar JSON value: a string (owned, unescaped copy), a number (raw
+// slice into the input buffer) or a literal (empty value).
+const JsonScalar = struct {
+    s: []const u8,
+    owned: bool,
+};
+
+const JsonArr = struct {
+    name: []const u8,
+    items: std.ArrayListUnmanaged(JsonScalar) = .empty,
+
+    fn deinit(self: *JsonArr, alloc: Alloc) void {
+        for (self.items.items) |el| if (el.owned) alloc.free(el.s);
+        self.items.deinit(alloc);
+        alloc.free(self.name);
+    }
+};
+
 const JsonObj = struct {
     names: std.ArrayListUnmanaged([]const u8) = .empty,
     vals: std.ArrayListUnmanaged([]const u8) = .empty,
     nums: std.ArrayListUnmanaged(bool) = .empty,
+    arrs: std.ArrayListUnmanaged(JsonArr) = .empty,
     alloc: Alloc,
 
     fn deinit(self: *JsonObj) void {
@@ -1280,9 +1384,11 @@ const JsonObj = struct {
             if (!is_num) self.alloc.free(self.vals.items[i]);
             self.alloc.free(self.names.items[i]);
         }
+        for (self.arrs.items) |*a| a.deinit(self.alloc);
         self.names.deinit(self.alloc);
         self.vals.deinit(self.alloc);
         self.nums.deinit(self.alloc);
+        self.arrs.deinit(self.alloc);
     }
 
     // string value for a field, or `def` when absent.
@@ -1301,6 +1407,14 @@ const JsonObj = struct {
             }
         }
         return def;
+    }
+
+    // array value for a field, or null when absent / not an array.
+    fn arr(self: *const JsonObj, name: []const u8) ?[]const JsonScalar {
+        for (self.arrs.items) |a| {
+            if (std.mem.eql(u8, a.name, name)) return a.items.items;
+        }
+        return null;
     }
 };
 
@@ -1361,6 +1475,31 @@ fn json_parse_string(alloc: Alloc, s: []const u8, i: *usize) ?[]u8 {
     return null;
 }
 
+// Parse one scalar JSON value at s[i]: a string (owned copy), a number (raw
+// slice into s) or a literal true/false/null (empty value). Advances i.
+fn json_parse_scalar(alloc: Alloc, s: []const u8, i: *usize, out: *JsonScalar) bool {
+    if (i.* >= s.len) return false;
+    const c = s[i.*];
+    if (c == '"') {
+        const v = json_parse_string(alloc, s, i) orelse return false;
+        out.* = .{ .s = v, .owned = true };
+        return true;
+    }
+    if (c == '-' or (c >= '0' and c <= '9')) {
+        const start = i.*;
+        while (i.* < s.len and ((s[i.*] >= '0' and s[i.*] <= '9') or s[i.*] == '-' or s[i.*] == '+' or s[i.*] == '.' or s[i.*] == 'e' or s[i.*] == 'E')) i.* += 1;
+        out.* = .{ .s = s[start..i.*], .owned = false };
+        return true;
+    }
+    if (std.mem.startsWith(u8, s[i.*..], "true") or std.mem.startsWith(u8, s[i.*..], "false") or std.mem.startsWith(u8, s[i.*..], "null")) {
+        // literal: consume it, store an empty string value
+        i.* += if (s[i.*] == 't') 4 else if (s[i.*] == 'f') 5 else 4;
+        out.* = .{ .s = "", .owned = false };
+        return true;
+    }
+    return false;
+}
+
 // Parse one JSON object from `s` into `obj`. Advances nothing (object must be
 // the whole record). Returns false on malformed JSON.
 fn json_parse_object(alloc: Alloc, s: []const u8, obj: *JsonObj) bool {
@@ -1382,29 +1521,51 @@ fn json_parse_object(alloc: Alloc, s: []const u8, obj: *JsonObj) bool {
         skip_ws(s, &i);
         if (i >= s.len) return false;
         const c = s[i];
-        var value: []const u8 = "";
-        var is_num = false;
-        if (c == '"') {
-            value = json_parse_string(alloc, s, &i) orelse {
-                alloc.free(key);
+        if (c == '[') {
+            // array of scalars (only `cols` of a fact record needs this)
+            var a = JsonArr{ .name = key };
+            i += 1;
+            skip_ws(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else while (true) {
+                skip_ws(s, &i);
+                var el = JsonScalar{ .s = "", .owned = false };
+                if (!json_parse_scalar(alloc, s, &i, &el)) {
+                    a.deinit(alloc);
+                    return false;
+                }
+                a.items.append(alloc, el) catch {
+                    a.deinit(alloc);
+                    return false;
+                };
+                skip_ws(s, &i);
+                if (i < s.len and s[i] == ',') {
+                    i += 1;
+                    continue;
+                }
+                if (i < s.len and s[i] == ']') {
+                    i += 1;
+                    break;
+                }
+                a.deinit(alloc);
+                return false;
+            }
+            obj.arrs.append(alloc, a) catch {
+                a.deinit(alloc);
                 return false;
             };
-        } else if (c == '-' or (c >= '0' and c <= '9')) {
-            const start = i;
-            while (i < s.len and ((s[i] >= '0' and s[i] <= '9') or s[i] == '-' or s[i] == '+' or s[i] == '.' or s[i] == 'e' or s[i] == 'E')) i += 1;
-            value = s[start..i];
-            is_num = true;
-        } else if (std.mem.startsWith(u8, s[i..], "true") or std.mem.startsWith(u8, s[i..], "false") or std.mem.startsWith(u8, s[i..], "null")) {
-            // literal: consume it, store an empty string value
-            i += if (s[i] == 't') 4 else if (s[i] == 'f') 5 else 4;
-            value = "";
         } else {
-            alloc.free(key);
-            return false;
+            var v = JsonScalar{ .s = "", .owned = false };
+            if (!json_parse_scalar(alloc, s, &i, &v)) {
+                alloc.free(key);
+                return false;
+            }
+            obj.names.append(alloc, key) catch return false;
+            obj.vals.append(alloc, v.s) catch return false;
+            // `nums` drives both the deinit (own or not) and obj.num()
+            obj.nums.append(alloc, !v.owned) catch return false;
         }
-        obj.names.append(alloc, key) catch return false;
-        obj.vals.append(alloc, value) catch return false;
-        obj.nums.append(alloc, is_num) catch return false;
         skip_ws(s, &i);
         if (i >= s.len) return false;
         if (s[i] == ',') {
@@ -1421,7 +1582,71 @@ fn import_fail(ctx: *Ctx, comptime fmt: []const u8, args: anytype) noreturn {
     die("error: import failed: " ++ fmt, args);
 }
 
-fn cmd_import(ctx: *Ctx, file: []const u8) void {
+// Arity of a declared relation, read from the store's rels.txt
+// ("name:arity:edb|idb[:kinds]"; '*' marks a variadic relation -> 0). Returns
+// null when the store holds no such declaration. The engine has no live-arity
+// accessor, and rels.txt is rewritten eagerly on every dl_declare_relation, so
+// this is the authoritative record (including a relation declared moments ago).
+fn rel_arity(ctx: *Ctx, dbdir: []const u8, name: []const u8) ?u8 {
+    const alloc = ctx.alloc;
+    const pathz = std.fmt.allocPrintSentinel(alloc, "{s}/rels.txt", .{dbdir}, 0) catch return null;
+    defer alloc.free(pathz);
+    const f = fopen(@ptrCast(pathz.ptr), "r") orelse return null;
+    defer _ = fclose(f);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const line = fgets(@ptrCast(&buf), @intCast(buf.len), f);
+        if (line == null) break;
+        const len = std.mem.len(line);
+        const s = std.mem.trim(u8, line[0..len], " \t\r\n");
+        if (s.len == 0 or s[0] == '#') continue;
+        const c1 = std.mem.indexOfScalar(u8, s, ':') orelse continue;
+        if (!std.mem.eql(u8, s[0..c1], name)) continue;
+        const rest = s[c1 + 1 ..];
+        const c2 = std.mem.indexOfScalar(u8, rest, ':') orelse rest.len;
+        const field = rest[0..c2];
+        if (std.mem.eql(u8, field, "*")) return 0; // variadic
+        return std.fmt.parseInt(u8, field, 10) catch null;
+    }
+    return null;
+}
+
+// Value rule mirrored from the dl CLI's CSV loader: an all-digit value that
+// fits u32 is stored RAW (an integer column), anything else is interned as a
+// symbol. The engine's one-space design then makes a raw int whose value equals
+// a live symbol id render as that symbol — documented, and unchanged here.
+fn fact_value(ctx: *Ctx, s: []const u8) u32 {
+    if (s.len > 0) {
+        var all_digits = true;
+        for (s) |c| {
+            if (!std.ascii.isDigit(c)) {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) {
+            if (std.fmt.parseInt(u32, s, 10)) |v| return v else |_| {}
+        }
+    }
+    return internz(ctx, s);
+}
+
+// One entity record accumulated across the lines of a single import file.
+// Buffered txn ops are invisible to entity_type()/prefix(), so the same name
+// seen twice would otherwise stack entity_ts rows, write two entity rows with
+// different types, or buffer a second CAS on one entity — which the engine
+// refuses at BUFFER time, aborting the whole import (a concatenated export
+// losing every row). Fields are owned; "" means the record omitted the field.
+const ImportEntity = struct {
+    name: []const u8,
+    etype: []const u8,
+    created: []const u8,
+    updated: []const u8,
+    rev: u32,
+    line: usize, // line of the record that set the type
+};
+
+fn cmd_import(ctx: *Ctx, file: []const u8, dbdir: []const u8) void {
     // read the whole file via libc (mirror cmd_query)
     const zpath = ctx.alloc.allocSentinel(u8, file.len, 0) catch die("oom", .{});
     defer ctx.alloc.free(zpath);
@@ -1449,11 +1674,37 @@ fn cmd_import(ctx: *Ctx, file: []const u8) void {
     if (dl.dl_txn_begin(ctx.db) != 0)
         die("error: import failed: cannot begin transaction", .{});
 
-    var n_entity: u64 = 0;
     var n_obs: u64 = 0;
     var n_rel: u64 = 0;
+    var n_fact: u64 = 0;
+    var lineno: usize = 0;
+    // entity records merged per name, in first-seen order (applied after the
+    // line loop); arity_cache memoizes rels.txt lookups for the whole import.
+    var ents = std.ArrayListUnmanaged(ImportEntity).empty;
+    defer {
+        for (ents.items) |e| {
+            ctx.alloc.free(e.name);
+            ctx.alloc.free(e.etype);
+            ctx.alloc.free(e.created);
+            ctx.alloc.free(e.updated);
+        }
+        ents.deinit(ctx.alloc);
+    }
+    var ent_idx = std.StringHashMapUnmanaged(usize).empty;
+    defer {
+        var kit = ent_idx.keyIterator();
+        while (kit.next()) |k| ctx.alloc.free(k.*);
+        ent_idx.deinit(ctx.alloc);
+    }
+    var arity_cache = std.StringHashMapUnmanaged(u8).empty;
+    defer {
+        var ait = arity_cache.keyIterator();
+        while (ait.next()) |k| ctx.alloc.free(k.*);
+        arity_cache.deinit(ctx.alloc);
+    }
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |raw| {
+        lineno += 1;
         // tolerate blank lines (trailing newline, stray whitespace)
         var s = raw;
         while (s.len > 0 and (s[0] == ' ' or s[0] == '\t' or s[0] == '\r')) s = s[1..];
@@ -1472,20 +1723,40 @@ fn cmd_import(ctx: *Ctx, file: []const u8) void {
             const created = obj.str("created", "");
             const updated = obj.str("updated", "");
             const rev = obj.num("rev", 0);
-            var ecols: [2]u32 = .{ internz(ctx, name), internz(ctx, etype) };
-            if (dl.dl_txn_add_fact(ctx.db, "entity", &ecols, 2) != 0)
-                import_fail(ctx, "cannot add entity fact", .{});
-            var ts_cols: [3]u32 = .{ internz(ctx, name), internz(ctx, created), internz(ctx, updated) };
-            if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ts_cols, 3) != 0)
-                import_fail(ctx, "cannot add entity_ts fact", .{});
-            if (rev > 0) {
-                // 0 -> R: fresh db starts the implicit rev row at 0.
-                const zname = zdup(ctx, name);
-                defer ctx.alloc.free(zname);
-                if (dl.dl_txn_cas(ctx.db, zname.ptr, 0, rev) != 0)
-                    import_fail(ctx, "cannot set revision for '{s}'", .{name});
+            // ACCUMULATE, do not write yet: buffered txn ops are invisible to
+            // entity_type()/prefix(), so a file naming one entity twice would
+            // stack entity_ts rows, write two entity rows with different types,
+            // or buffer a second CAS on one entity (which the engine refuses at
+            // BUFFER time — killing the whole import). One merged record per
+            // name, applied below as ONE op-set and at most one CAS.
+            if (ent_idx.get(name)) |ei| {
+                const e = &ents.items[ei];
+                if (!std.mem.eql(u8, e.etype, etype))
+                    import_fail(ctx, "entity '{s}' has type '{s}' on line {d} but type '{s}' on line {d}", .{ name, e.etype, e.line, etype, lineno });
+                // created_at is creation time: the first non-empty one wins.
+                // updated_at is latest-wins. An omitted field never wipes a
+                // value (see txn_refresh_entity_ts).
+                if (e.created.len == 0 and created.len > 0) {
+                    ctx.alloc.free(e.created);
+                    e.created = ctx.alloc.dupe(u8, created) catch die("oom", .{});
+                }
+                if (updated.len > 0) {
+                    ctx.alloc.free(e.updated);
+                    e.updated = ctx.alloc.dupe(u8, updated) catch die("oom", .{});
+                }
+                if (rev > e.rev) e.rev = rev;
+            } else {
+                ents.append(ctx.alloc, .{
+                    .name = ctx.alloc.dupe(u8, name) catch die("oom", .{}),
+                    .etype = ctx.alloc.dupe(u8, etype) catch die("oom", .{}),
+                    .created = ctx.alloc.dupe(u8, created) catch die("oom", .{}),
+                    .updated = ctx.alloc.dupe(u8, updated) catch die("oom", .{}),
+                    .rev = rev,
+                    .line = lineno,
+                }) catch die("oom", .{});
+                const key = ctx.alloc.dupe(u8, name) catch die("oom", .{});
+                ent_idx.put(ctx.alloc, key, ents.items.len - 1) catch die("oom", .{});
             }
-            n_entity += 1;
         } else if (std.mem.eql(u8, kind, "obs")) {
             const ent = obj.str("entity", "");
             const content = obj.str("content", "");
@@ -1505,16 +1776,117 @@ fn cmd_import(ctx: *Ctx, file: []const u8) void {
             if (dl.dl_txn_add_fact(ctx.db, "edge", &rcols, 3) != 0)
                 import_fail(ctx, "cannot add edge fact", .{});
             n_rel += 1;
+        } else if (std.mem.eql(u8, kind, "fact")) {
+            // a tuple of a CUSTOM relation: {"k":"fact","rel":R,"cols":[...]}
+            const rel = obj.str("rel", "");
+            if (rel.len == 0)
+                import_fail(ctx, "fact record on line {d} has no \"rel\"", .{lineno});
+            const cols = obj.arr("cols") orelse
+                import_fail(ctx, "fact record for '{s}' on line {d} has no \"cols\" array", .{ rel, lineno });
+            if (cols.len == 0 or cols.len > 8)
+                import_fail(ctx, "fact record for '{s}' on line {d} has {d} columns (need 1-8)", .{ rel, lineno, cols.len });
+            const want: u8 = @intCast(cols.len);
+            const zrel = zdup(ctx, rel);
+            defer ctx.alloc.free(zrel);
+            const declared: ?u8 = if (arity_cache.get(rel)) |a| a else blk: {
+                const a = rel_arity(ctx, dbdir, rel);
+                if (a) |v| {
+                    const key = ctx.alloc.dupe(u8, rel) catch die("oom", .{});
+                    arity_cache.put(ctx.alloc, key, v) catch die("oom", .{});
+                }
+                break :blk a;
+            };
+            if (declared) |d| {
+                // 0 = variadic. dl_txn_add_fact refuses variadic relations, so
+                // the transactional import cannot fill one: say so instead of
+                // surfacing the engine's opaque -1.
+                if (d == 0)
+                    import_fail(ctx, "relation '{s}' is variadic; the transactional import needs a fixed arity (declare it with arity 1-8)", .{rel});
+                if (d != want)
+                    import_fail(ctx, "relation '{s}' is declared with arity {d} but the fact on line {d} has {d} columns", .{ rel, d, lineno, want });
+            } else {
+                // auto-declare on first sight, so a round-trip of a store that
+                // carries custom relations bootstraps without a separate step
+                if (dl.dl_declare_relation(ctx.db, zrel.ptr, want) != 0)
+                    import_fail(ctx, "cannot declare relation '{s}' (line {d})", .{ rel, lineno });
+                errOut("note: declared relation '{s}' with arity {d}\n", .{ rel, want });
+                const key = ctx.alloc.dupe(u8, rel) catch die("oom", .{});
+                arity_cache.put(ctx.alloc, key, want) catch die("oom", .{});
+            }
+            var vals: [8]u32 = undefined;
+            for (cols, 0..) |c, ci| vals[ci] = fact_value(ctx, c.s);
+            if (dl.dl_txn_add_fact(ctx.db, zrel.ptr, &vals, want) != 0)
+                import_fail(ctx, "cannot add fact to '{s}' (line {d})", .{ rel, lineno });
+            n_fact += 1;
         } else {
             import_fail(ctx, "unknown record kind '{s}'", .{kind});
         }
     }
 
-    if (dl.dl_txn_commit(ctx.db) != 0)
-        import_fail(ctx, "commit failed", .{});
-    emit("imported: {d} entities, {d} observations, {d} relations ({d} total)\n", .{
-        n_entity, n_obs, n_rel, n_entity + n_obs + n_rel,
-    });
+    // Apply the merged entity records: one entity fact add, one entity_ts row
+    // and at most one CAS per name (the engine refuses a second buffered CAS on
+    // one entity, and a second entity_ts add would stack a stale row).
+    for (ents.items) |e| {
+        const namesym = internz(ctx, e.name);
+        var ecols: [2]u32 = .{ namesym, internz(ctx, e.etype) };
+        const zname = zdup(ctx, e.name);
+        defer ctx.alloc.free(zname);
+        const created_in: ?u32 = if (e.created.len > 0) internz(ctx, e.created) else null;
+        const updated_in: ?u32 = if (e.updated.len > 0) internz(ctx, e.updated) else null;
+        if (entity_type(ctx, e.name)) |cur_type| {
+            // entity present: import is an UPSERT, not an insert. A type change
+            // is refused loudly (two types for one name would make every
+            // entity_type() read order-dependent).
+            if (!std.mem.eql(u8, cur_type, e.etype))
+                import_fail(ctx, "entity '{s}' exists with type '{s}' but import declares '{s}' (line {d})", .{ e.name, cur_type, e.etype, e.line });
+            // the entity fact add is set-idempotent (duplicate -> 0)
+            if (dl.dl_txn_add_fact(ctx.db, "entity", &ecols, 2) != 0)
+                import_fail(ctx, "cannot add entity fact", .{});
+            // entity_ts: replace every stale row with one merged row; an
+            // omitted field keeps its recorded value
+            txn_refresh_entity_ts(ctx, namesym, created_in, updated_in);
+            // rev only ever moves forward; equal or lower is a no-op
+            const cur_rev = rev_get(ctx, e.name);
+            if (e.rev > cur_rev) {
+                if (dl.dl_txn_cas(ctx.db, zname.ptr, cur_rev, e.rev) != 0)
+                    import_fail(ctx, "cannot set revision for '{s}' (line {d})", .{ e.name, e.line });
+            }
+        } else {
+            if (dl.dl_txn_add_fact(ctx.db, "entity", &ecols, 2) != 0)
+                import_fail(ctx, "cannot add entity fact", .{});
+            var ts_cols: [3]u32 = .{
+                namesym,
+                created_in orelse internz(ctx, ""),
+                updated_in orelse internz(ctx, ""),
+            };
+            if (dl.dl_txn_add_fact(ctx.db, "entity_ts", &ts_cols, 3) != 0)
+                import_fail(ctx, "cannot add entity_ts fact", .{});
+            if (e.rev > 0) {
+                // 0 -> R: fresh db starts the implicit rev row at 0.
+                if (dl.dl_txn_cas(ctx.db, zname.ptr, 0, e.rev) != 0)
+                    import_fail(ctx, "cannot set revision for '{s}'", .{e.name});
+            }
+        }
+    }
+
+    // Honest errors: the engine's commit code is reported, never flattened to a
+    // bare "commit failed" (a DL_E_CONFLICT used to surface as exactly that).
+    const crc = dl.dl_txn_commit(ctx.db);
+    if (crc != 0)
+        import_fail(ctx, "commit failed (engine error {d})", .{crc});
+    // A file may carry several records for one entity (a concatenated export),
+    // so the reported count is the number of entities APPLIED (distinct names),
+    // not the number of records read.
+    const n_ent_applied: u64 = ents.items.len;
+    if (n_fact > 0) {
+        emit("imported: {d} entities, {d} observations, {d} relations, {d} facts ({d} total)\n", .{
+            n_ent_applied, n_obs, n_rel, n_fact, n_ent_applied + n_obs + n_rel + n_fact,
+        });
+    } else {
+        emit("imported: {d} entities, {d} observations, {d} relations ({d} total)\n", .{
+            n_ent_applied, n_obs, n_rel, n_ent_applied + n_obs + n_rel,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,8 +1922,17 @@ const usage =
     \\  del-rel --from A --to B --type REL
     \\  rev <name>
     \\  count [<rel>]
+    \\  declare <rel> <arity>   # declare a custom relation (0 = variadic, else 1-8)
+    \\  facts <rel>             # dump a relation's tuples
     \\  query <source-or-file> <goal_rel>   # run arbitrary Datalog rules, print goal tuples
-    \\  import <file.jsonl>   # bulk-load NDJSON entities/observations/relations
+    \\      # a program the stratified evaluator rejects as unstratifiable is retried
+    \\      # under well-founded semantics (cyclic negation), so 'win(X) :- edge(X,Y,"move"), !win(Y).' answers.
+    \\  import <file.jsonl>   # bulk-load NDJSON entities/observations/relations/facts
+    \\      # {"k":"fact","rel":"want","cols":["a",2]} loads a tuple of a custom
+    \\      # relation; all-digit values that fit u32 are stored raw, anything else
+    \\      # is interned, and the relation is auto-declared at the first fact's arity.
+    \\      # An existing entity is upserted (same type; rev only moves forward);
+    \\      # a different type is an error.
     \\
     \\db: $FX_AGENT_MEMORY_DB | $JING_MEMORY_DB | config file ($FX_AGENT_MEMORY_CONFIG | $XDG_CONFIG_HOME/hax/fx-agent-memory | ~/.config/hax/fx-agent-memory) | $HOME/.jing/memory.dl
     \\
@@ -1605,7 +1986,7 @@ fn positional(args: []const []const u8) std.ArrayListUnmanaged([]const u8) {
 // search is deliberately NOT here: it calls dl_index_observations, which
 // writes (txn begin/commit) and would fail on a read-only handle.
 fn is_read_only_cmd(cmd: []const u8) bool {
-    const ro_cmds = [_][]const u8{ "read", "graph", "traverse", "recent", "similar", "count", "rev", "query", "vsearch" };
+    const ro_cmds = [_][]const u8{ "read", "graph", "traverse", "recent", "similar", "count", "rev", "query", "vsearch", "facts" };
     for (ro_cmds) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
@@ -1760,6 +2141,16 @@ pub fn main(init: std.process.Init) void {
         defer pos.deinit(alloc);
         const rel = if (pos.items.len >= 1) pos.items[0] else "entity";
         cmd_count(&ctx, rel);
+    } else if (std.mem.eql(u8, cmd, "declare")) {
+        var pos = positional(cmd_args);
+        defer pos.deinit(alloc);
+        if (pos.items.len < 2) die("error: declare needs <rel> <arity>", .{});
+        cmd_declare(&ctx, dbdir, pos.items[0], pos.items[1]);
+    } else if (std.mem.eql(u8, cmd, "facts")) {
+        var pos = positional(cmd_args);
+        defer pos.deinit(alloc);
+        if (pos.items.len < 1) die("error: facts needs <rel>", .{});
+        cmd_facts(&ctx, pos.items[0]);
     } else if (std.mem.eql(u8, cmd, "query")) {
         var pos = positional(cmd_args);
         defer pos.deinit(alloc);
@@ -1769,7 +2160,7 @@ pub fn main(init: std.process.Init) void {
         var pos = positional(cmd_args);
         defer pos.deinit(alloc);
         if (pos.items.len < 1) die("error: import needs <file.jsonl>", .{});
-        cmd_import(&ctx, pos.items[0]);
+        cmd_import(&ctx, pos.items[0], dbdir);
     } else {
         errOut("error: unknown command '{s}'\n", .{cmd});
         std.process.exit(1);

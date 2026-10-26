@@ -55,9 +55,51 @@ fx-agent-memory [--db <dir>|-d <dir>] <command> [args]
   del-rel --from A --to B --type REL
   rev <name>                               # show CAS revision
   count [<rel>]
+  declare <rel> <arity>                    # declare a custom relation (0 = variadic, else 1-8)
+  facts <rel>                              # dump a relation's tuples
   query <source-or-file> <goal_rel>        # run arbitrary Datalog rules, print goal tuples
-  import <file.jsonl>                      # bulk-load NDJSON entities/observations/relations
+  import <file.jsonl>                      # bulk-load NDJSON entities/observations/relations/facts
 ```
+
+**Custom relations (namespacing):** `declare` exposes the engine's
+`dl_declare_relation`, so a consumer's attributes live in their own relation
+instead of colliding with the store's bookkeeping inside `edge/3`. It is
+idempotent on the same arity and refuses the built-in names (`entity`,
+`entity_ts`, `observation`, `obs_ts`, `edge`, `rev`) and a redeclaration at a
+different arity. A name must be 1-251 bytes with no whitespace, control
+characters or `:`: `rels.txt` is a getline/first-colon format with a 256-byte
+name buffer, and the engine opens `<name>.wal`, so a longer or multi-line name
+would truncate, split into a phantom relation, or vanish on reopen. `import`
+accepts `{"k":"fact","rel":R,"cols":[...]}`: an all-digit value that fits u32 is
+stored raw (an integer column), anything else is interned, and the relation is
+auto-declared at the first fact's arity with a note on stderr. `facts <rel>`
+dumps it; `count <rel>` is generic. A variadic (arity 0) relation can be
+declared but not filled by the transactional import (`dl_txn_add_fact` refuses
+variadic relations). Note that `{"k":"fact"}` is a RAW tuple surface: it writes
+the relation it names, including the store's own `entity`/`entity_ts`/`edge`
+relations — only `declare` refuses those names.
+
+**Query output** is one space-separated line per tuple. A column whose value
+does not resolve to a symbol is a raw integer and prints as a number; the
+engine's one-space design means an integer whose value equals a live symbol id
+renders as that symbol (the interner is 1-based and shares the u32 range — the
+encoding is deliberately unchanged). A program the stratified evaluator rejects
+as unstratifiable is retried under well-founded semantics, so
+`win(X) :- edge(X,Y,"move"), !win(Y).` answers instead of failing. An empty
+result prints `(no results)`; `facts <rel>` on an empty relation prints nothing
+(deliberately left inconsistent with `query` rather than changing a
+script-visible sentinel).
+
+**Import is an upsert** for entities: importing a line for an entity that
+already exists is idempotent (same type), refreshes `entity_ts`, and only moves
+the revision forward; a different type is a specific error naming the entity,
+both types and the line. A record that omits `created`/`updated` never wipes the
+recorded value (created_at is creation time, updated_at is latest-wins), and a
+re-import collapses any stacked `entity_ts` rows a pre-fix store may hold into
+one. Records are merged PER NAME across the whole file, so a concatenated
+export that names one entity several times imports cleanly, buffers one CAS per
+entity, and reports the number of entities APPLIED (distinct names) — two
+records for one name with different types are refused, naming both lines.
 
 **DB path precedence:** `--db` flag → `$FX_AGENT_MEMORY_DB` →
 config file → `$JING_MEMORY_DB` → `~/.jing/memory.dl`. The config file is
@@ -67,9 +109,9 @@ DB directory.
 
 **Concurrency:** writers open with a single-writer lock (`dl_open`, retried ~50×
 at 0.1s). Read-only commands (`read`, `graph`, `traverse`, `recent`, `similar`,
-`count`, `rev`, `query`, `vsearch`) instead open read-only (`dl_open_ro`, shared
-lock) so many readers coexist and never queue behind the writer. `search` is
-deliberately *not* read-only — it calls `dl_index_observations`, which writes.
+`count`, `rev`, `query`, `vsearch`, `facts`) instead open read-only (`dl_open_ro`,
+shared lock) so many readers coexist and never queue behind the writer. `search`
+is deliberately *not* read-only — it calls `dl_index_observations`, which writes.
 
 **Search:**
 - `search` — lexical full-text over observation content (term tokenization and
